@@ -20,6 +20,7 @@ import org.osmdroid.events.ScrollEvent;
 import org.osmdroid.events.ZoomEvent;
 import org.osmdroid.util.GeoPoint;
 import org.osmdroid.views.MapView;
+import org.osmdroid.views.Projection;
 import org.osmdroid.views.overlay.Marker;
 
 import java.util.ArrayList;
@@ -59,7 +60,12 @@ public class AccessibleMapView extends MapView {
     private Listener listener;
     private Marker locationMarker;
     private GeoPoint userLocation;
-    private double userZoom = 17.0;
+    /** Стартовый масштаб: 16 — видно улицы вокруг, а не один дом. */
+    private static final double DEFAULT_ZOOM = 16.0;
+    /** Предел радиуса загрузки: больше не влезает в лимиты OSM API по времени. */
+    private static final double MAX_FETCH_RADIUS_METERS = 6000;
+    private double userZoom = 16.0;
+    private boolean firstFixDone = false;
     private long lastReloadAt = 0;
     private final Runnable reloadRunnable = new Runnable() {
         @Override
@@ -96,6 +102,10 @@ public class AccessibleMapView extends MapView {
         api = new OsmApiClient(getContext());
         setMultiTouchControls(true);
         setMaxZoomLevel(19.0);
+        // Ниже 15 видимая высота экрана (~11 км на этом устройстве) больше
+        // области, которую реально отдаёт OSM API, и сверху/снизу остаётся
+        // пустая полоса. Поэтому ниже 15 не опускаемся.
+        setMinZoomLevel(15.0);
         setTilesScaledToDpi(true);
         // Явно включаем view: с выключенным MapView скринридер не получает
         // hover-события и виртуальные узлы.
@@ -142,8 +152,13 @@ public class AccessibleMapView extends MapView {
             getOverlays().add(locationMarker);
         }
         locationMarker.setPosition(point);
-        userZoom = 17.0;
-        getController().setZoom(userZoom);
+        // При первом определении показываем окрестность (16), а не 17 —
+        // иначе карта выглядит слишком приближённой и улицы не видно вокруг.
+        if (!firstFixDone) {
+            firstFixDone = true;
+            userZoom = DEFAULT_ZOOM;
+            getController().setZoom(userZoom);
+        }
         getController().animateTo(point);
         invalidate();
         Log.d(TAG, "setUserLocation -> " + point.getLatitude() + "," + point.getLongitude());
@@ -212,19 +227,9 @@ public class AccessibleMapView extends MapView {
             handler.postDelayed(reloadRunnable, 300);
             return;
         }
+        double radius = Math.min(visibleRadiusMeters(), MAX_FETCH_RADIUS_METERS);
         Log.d(TAG, "reloadFeatures center=" + center.getLatitude() + "," + center.getLongitude()
-                + " zoom=" + getZoomLevelDouble());
-        double zoom = getZoomLevelDouble();
-        double radius;
-        if (zoom >= 19) {
-            radius = 500;
-        } else if (zoom >= 17.5) {
-            radius = 900;
-        } else if (zoom >= 16) {
-            radius = 1500;
-        } else {
-            radius = 2000;
-        }
+                + " zoom=" + getZoomLevelDouble() + " radius=" + (int) radius);
         if (listener != null) {
             listener.onStatus(R.string.status_loading);
         }
@@ -264,6 +269,32 @@ public class AccessibleMapView extends MapView {
                 handler.postDelayed(reloadRunnable, 15000);
             }
         });
+    }
+
+    /**
+     * Радиус загрузки: половина диагонали видимого прямоугольника плюс запас,
+     * чтобы объекты покрывали весь экран, а не только окрестность центра.
+     */
+    private double visibleRadiusMeters() {
+        IGeoPoint center = getMapCenter();
+        if (center == null || getWidth() <= 0 || getHeight() <= 0) {
+            return 1500;
+        }
+        Projection p = getProjection();
+        if (p == null) {
+            return 1500;
+        }
+        IGeoPoint topLeft = p.fromPixels(0, 0);
+        IGeoPoint bottomRight = p.fromPixels(getWidth(), getHeight());
+        if (topLeft == null || bottomRight == null) {
+            return 1500;
+        }
+        double dLatM = Math.abs(topLeft.getLatitude() - bottomRight.getLatitude()) * 110574.0;
+        double dLonM = Math.abs(bottomRight.getLongitude() - topLeft.getLongitude())
+                * 111320.0 * Math.cos(Math.toRadians(center.getLatitude()));
+        double halfDiagonal = Math.hypot(dLatM, dLonM) / 2.0;
+        // Запас 40%: карта догружает окрестность, пока пользователь сдвигает её.
+        return Math.max(600, halfDiagonal * 1.4);
     }
 
     /** Количество объектов, не являющихся синтезированными перекрёстками. */

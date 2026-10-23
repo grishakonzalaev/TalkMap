@@ -41,8 +41,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -74,6 +76,8 @@ public class OsmApiClient {
     }
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    /** Пул для параллельной загрузки тайлов (4 квадранта одновременно). */
+    private final ExecutorService tilePool = Executors.newFixedThreadPool(4);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Context appContext;
     private final OkHttpClient http;
@@ -180,14 +184,40 @@ public class OsmApiClient {
 
     private Result fetchOnce(double lat, double lon, double radius) {
         Result r = new Result();
-        // 1) Официальный API OpenStreetMap. На телефоне доступен напрямую
-        //    (проверено: 200), в отличие от публичных Overpass-серверов.
-        //    Один запрос возвращает и объекты, и дороги (узлы/пути/теги).
+        // 1) Официальный API OpenStreetMap. У него жёсткий лимит: не более
+        //    50 000 узлов на запрос, поэтому большую область режем сеткой
+        //    тайлов — иначе при уменьшении масштаба bbox отклоняется (400)
+        //    и на карте не появляется ничего нового.
         try {
-            String xml = fetchApiMap(lat, lon, radius);
-            String json = apiXmlToJson(xml);
-            r.features.addAll(parseObjects(json, lat, lon));
-            r.roads.addAll(parseRoads(json));
+            // На стыках тайлов одни и те же объекты приходят дважды — убираем дубли.
+            Set<String> seen = new HashSet<>();
+            for (String xml : fetchMapXml(lat, lon, radius)) {
+                if (xml == null) {
+                    continue;
+                }
+                String json = apiXmlToJson(xml);
+                for (MapFeature f : parseObjects(json, lat, lon)) {
+                    if (seen.add(f.type + "|" + f.name + "|"
+                            + String.format(Locale.US, "%.5f,%.5f", f.lat, f.lon))) {
+                        r.features.add(f);
+                    }
+                }
+                for (RoadInfo road : parseRoads(json)) {
+                    boolean dup = false;
+                    for (RoadInfo existing : r.roads) {
+                        if (existing.name.equals(road.name)
+                                && existing.geometry.size() == road.geometry.size()
+                                && !existing.geometry.isEmpty()
+                                && existing.geometry.get(0).equals(road.geometry.get(0))) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        r.roads.add(road);
+                    }
+                }
+            }
             Log.i(TAG, "OSM API loaded features=" + r.features.size()
                     + " roads=" + r.roads.size());
         } catch (Exception e) {
@@ -226,6 +256,13 @@ public class OsmApiClient {
     // Официальный API OpenStreetMap: GET /api/0.6/map?bbox=...
     // ------------------------------------------------------------------
     private static final String API_MAP = "https://api.openstreetmap.org/api/0.6/map";
+    /** Глубина дробления bbox при отказе сервера (макс. 4^3 = 64 запроса). */
+    private static final int MAX_SPLIT_DEPTH = 3;
+    /** Предел запросов на одну загрузку, чтобы не залить сервер при плотном центре. */
+    private static final int MAX_TILE_REQUESTS = 24;
+    /** Счётчик оставшихся запросов для текущей загрузки (см. fetchMapXml). */
+    private final java.util.concurrent.atomic.AtomicInteger requestsLeft =
+            new java.util.concurrent.atomic.AtomicInteger(MAX_TILE_REQUESTS);
 
     // ------------------------------------------------------------------
     // Сеть. Системный DNS на телефоне нестабилен (приложение ходит в обход
@@ -316,31 +353,112 @@ public class OsmApiClient {
         }
     }
 
-    private String fetchApiMap(double lat, double lon, double radius) throws Exception {
-        double cosLat = Math.cos(Math.toRadians(lat));
+    /**
+     * Загружает XML для области, дробя её только при отказе сервера.
+     * Официальный API отклоняет bbox плотнее 50 000 узлов, поэтому сначала
+     * пробуем целиком (быстро, один запрос), а при отказе делим на 4 части
+     * и повторяем рекурсивно до {@link #MAX_SPLIT_DEPTH}.
+     */
+    private List<String> fetchMapXml(double lat, double lon, double radius) {
         double dLat = radius / 110574.0;
+        double cosLat = Math.cos(Math.toRadians(lat));
         double dLon = radius / (111320.0 * cosLat);
+        requestsLeft.set(MAX_TILE_REQUESTS);
+        // Верхний уровень делим на 4 и грузим параллельно: даже в плотном
+        // центре это 4 запроса вместо последовательных, и карта заполняется
+        // по всему экрану, а не только вокруг центра.
+        double midLat = lat;
+        double midLon = lon;
+        double[][] quads = {
+                {lat - dLat, lon - dLon, midLat, midLon},
+                {lat - dLat, midLon, midLat, lon + dLon},
+                {midLat, lon - dLon, lat + dLat, midLon},
+                {midLat, midLon, lat + dLat, lon + dLon}
+        };
+        List<Future<List<String>>> futures = new ArrayList<>();
+        for (final double[] q : quads) {
+            futures.add(tilePool.submit(new Callable<List<String>>() {
+                @Override
+                public List<String> call() {
+                    List<String> part = new ArrayList<>();
+                    fetchBoxXml(q[0], q[1], q[2], q[3], 1, part);
+                    return part;
+                }
+            }));
+        }
+        List<String> out = new ArrayList<>();
+        for (Future<List<String>> f : futures) {
+            try {
+                out.addAll(f.get(90, TimeUnit.SECONDS));
+            } catch (Exception e) {
+                Log.w(TAG, "OSM tile group failed: " + e.getMessage());
+            }
+        }
+        Log.i(TAG, "OSM tiles=" + out.size());
+        return out;
+    }
+
+    private void fetchBoxXml(double minLat, double minLon, double maxLat,
+                             double maxLon, int depth, List<String> out) {
+        if (requestsLeft.get() <= 0) {
+            return;
+        }
+        requestsLeft.decrementAndGet();
+        BoxResponse resp = fetchApiMapBox(minLat, minLon, maxLat, maxLon);
+        if (resp.xml != null) {
+            out.add(resp.xml);
+            return;
+        }
+        if (!resp.tooDense) {
+            // Сеть/сервер недоступны — дробление не поможет, только добавит запросы.
+            return;
+        }
+        if (depth >= MAX_SPLIT_DEPTH) {
+            Log.w(TAG, "OSM tile skipped (still too dense at depth " + depth + ")");
+            return;
+        }
+        double midLat = (minLat + maxLat) / 2.0;
+        double midLon = (minLon + maxLon) / 2.0;
+        fetchBoxXml(minLat, minLon, midLat, midLon, depth + 1, out);
+        fetchBoxXml(minLat, midLon, midLat, maxLon, depth + 1, out);
+        fetchBoxXml(midLat, minLon, maxLat, midLon, depth + 1, out);
+        fetchBoxXml(midLat, midLon, maxLat, maxLon, depth + 1, out);
+    }
+
+    /** Ответ на запрос bbox: либо XML, либо причина отказа. */
+    private static class BoxResponse {
+        final String xml;
+        final boolean tooDense;
+
+        BoxResponse(String xml, boolean tooDense) {
+            this.xml = xml;
+            this.tooDense = tooDense;
+        }
+    }
+
+    /**
+     * Запрос одного прямоугольника. При отказе «слишком много узлов»
+     * помечаем tooDense — вызывающий разделит участок и повторит.
+     */
+    private BoxResponse fetchApiMapBox(double minLat, double minLon,
+                                       double maxLat, double maxLon) {
         // bbox: minlon,minlat,maxlon,maxlat (порядок OSM API)
         String bbox = String.format(Locale.US, "%.6f,%.6f,%.6f,%.6f",
-                lon - dLon, lat - dLat, lon + dLon, lat + dLat);
+                minLon, minLat, maxLon, maxLat);
         Request request = new Request.Builder()
                 .url(API_MAP + "?bbox=" + bbox)
                 .header("User-Agent", "TalkMap/1.0 (Android; tactile map for visually impaired)")
                 .build();
-        int code;
-        String body;
         try (Response resp = http.newCall(request).execute()) {
-            code = resp.code();
-            body = resp.body().string();
-        }
-        if (code >= 300) {
-            // 400 = слишком большая рамка (более 50 000 элементов) — уменьшаем радиус.
-            if (code == 400 && radius > 250) {
-                return fetchApiMap(lat, lon, radius / 2);
+            if (!resp.isSuccessful()) {
+                Log.w(TAG, "OSM tile HTTP " + resp.code() + " for " + bbox);
+                return new BoxResponse(null, resp.code() == 400 || resp.code() == 509);
             }
-            throw new Exception("OSM API HTTP " + code);
+            return new BoxResponse(resp.body().string(), false);
+        } catch (Exception e) {
+            Log.w(TAG, "OSM tile failed " + bbox + ": " + e.getMessage());
+            return new BoxResponse(null, false);
         }
-        return body;
     }
 
     // ------------------------------------------------------------------
@@ -455,7 +573,7 @@ public class OsmApiClient {
         BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
         String line;
         while ((line = reader.readLine()) != null) {
-            if (sb.length() > 8_000_000) {
+            if (sb.length() > 32_000_000) {
                 throw new Exception("OSM response too large");
             }
             sb.append(line);
