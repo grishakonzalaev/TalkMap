@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <plurals name="objects_found">
+        <item quantity="one">Найдено: %1$d объект</item>
+        <item quantity="few">Найдено: %1$d объекта</item>
+        <item quantity="many">Найдено: %1$d объектов</item>
+        <item quantity="other">Найдено: %1$d объектов</item>
+    </plurals>
+</resources>

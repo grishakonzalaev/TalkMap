@@ -1,0 +1,24 @@
+# Android / Gradle
+.gradle/
+app/build/
+build/
+local.properties
+
+# Служебная папка {do}aid
+.doaid/
+
+# Скачанные APK и распаковки
+/*.apk
+seeing_extract/
+
+# Диагностические файлы в корне проекта
+/*.txt
+/*.xml
+/*.log
+/*.json
+/*.so
+
+# Среда разработки
+.idea/
+*.iml
+captures/

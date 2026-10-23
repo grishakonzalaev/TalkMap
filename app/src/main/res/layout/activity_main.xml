@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ru.talkmap.app.AccessibleMapView
+        android:id="@+id/map"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@string/map_description" />
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="8dp"
+        android:background="#B3000000"
+        android:importantForAccessibility="no"
+        android:maxLines="3"
+        android:padding="8dp"
+        android:text="@string/status_waiting_location"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp" />
+
+    <ImageButton
+        android:id="@+id/btn_my_location"
+        android:layout_width="56dp"
+        android:layout_height="56dp"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="16dp"
+        android:background="#CC1565C0"
+        android:contentDescription="@string/btn_my_location"
+        android:padding="12dp"
+        android:src="@drawable/ic_my_location" />
+
+    <LinearLayout
+        android:id="@+id/zoom_controls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|start"
+        android:layout_margin="16dp"
+        android:orientation="vertical"
+        android:importantForAccessibility="yes">
+
+        <ImageButton
+            android:id="@+id/btn_zoom_in"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:background="#CC1565C0"
+            android:contentDescription="@string/btn_zoom_in"
+            android:padding="10dp"
+            android:src="@drawable/ic_zoom_in" />
+
+        <ImageButton
+            android:id="@+id/btn_zoom_out"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:background="#CC1565C0"
+            android:contentDescription="@string/btn_zoom_out"
+            android:padding="10dp"
+            android:src="@drawable/ic_zoom_out" />
+
+        <ImageButton
+            android:id="@+id/btn_zoom_reset"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:layout_marginTop="8dp"
+            android:background="#CC1565C0"
+            android:contentDescription="@string/btn_zoom_reset"
+            android:padding="10dp"
+            android:src="@drawable/ic_scale_reset" />
+    </LinearLayout>
+</FrameLayout>

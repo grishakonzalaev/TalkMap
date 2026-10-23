@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TalkMap</string>
+    <string name="map_description">Карта города. Проведите пальцем по экрану — диктор назовёт объекты под пальцем.</string>
+    <string name="map_empty">Под пальцем нет подписанных объектов. Ведите пальцем дальше по экрану.</string>
+    <string name="status_waiting_location">Ищу ваше местоположение…</string>
+    <string name="status_location_found">Местоположение получено. Загружаю объекты карты…</string>
+    <string name="status_location_denied">Доступ к местоположению не разрешён. Показан Новосибирск. Один палец — вести по карте, два пальца — изменять масштаб.</string>
+    <string name="status_loading">Загружаю объекты карты…</string>
+    <string name="status_objects_count">Объектов рядом: %1$d</string>
+    <string name="status_network_error">Не удалось загрузить объекты. Проверьте подключение к интернету.</string>
+    <string name="status_no_objects">Подписанных объектов рядом нет.</string>
+    <string name="btn_my_location">Кнопка: вернуться к моему местоположению</string>
+    <string name="btn_zoom_in">Кнопка: увеличить масштаб</string>
+    <string name="btn_zoom_out">Кнопка: уменьшить масштаб</string>
+    <string name="btn_zoom_reset">Кнопка: исходный масштаб</string>
+</resources>
