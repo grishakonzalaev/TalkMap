@@ -212,6 +212,14 @@ public class MainActivity extends AppCompatActivity
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // После возврата из фона или снятия блокировки карта могла
+        // остаться без объектов: обновляем её, не дожидаясь жеста.
+        map.showNoLocation();
+    }
+
+    @Override
     protected void onDestroy() {
         stopLocationUpdates();
         super.onDestroy();

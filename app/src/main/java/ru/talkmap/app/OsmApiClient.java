@@ -41,10 +41,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -75,12 +76,25 @@ public class OsmApiClient {
         }
     }
 
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService executor = new ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS,
+            // Очередь на 1 задачу: пока долгая загрузка висит, пользователь
+            // двигает карту — старые запросы отбрасываются, остаётся самый
+            // свежий. Раньше очередь росла неограниченно и «зависала» так,
+            // что приходилось убивать приложение.
+            new ArrayBlockingQueue<Runnable>(1),
+            new ThreadPoolExecutor.DiscardOldestPolicy());
     /** Пул для параллельной загрузки тайлов (4 квадранта одновременно). */
-    private final ExecutorService tilePool = Executors.newFixedThreadPool(4);
+    private final ExecutorService tilePool = new ThreadPoolExecutor(
+            4, 4, 0L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<Runnable>(8),
+            new ThreadPoolExecutor.DiscardOldestPolicy());
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Context appContext;
     private final OkHttpClient http;
+    /** Номер запроса: показываем только результат самого свежего. */
+    private final java.util.concurrent.atomic.AtomicInteger fetchGeneration =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     public OsmApiClient(Context context) {
         this.appContext = context.getApplicationContext();
@@ -95,29 +109,44 @@ public class OsmApiClient {
 
     public void fetchAsync(final double lat, final double lon, final double radiusMeters,
                            final Callback callback) {
+        final int generation = fetchGeneration.incrementAndGet();
         executor.execute(new Runnable() {
             @Override
             public void run() {
                 try {
                     final Result result = fetchAll(lat, lon, radiusMeters);
                     if (!result.features.isEmpty() || !result.roads.isEmpty()) {
-                        saveCache(result);
+                        saveCache(result, lat, lon, radiusMeters);
                     }
                     main.post(new Runnable() {
                         @Override
                         public void run() {
+                            // Пользователь мог уехать, пока запрос висел:
+                            // устаревший результат не должен перетирать карту.
+                            if (generation != fetchGeneration.get()) {
+                                Log.d(TAG, "stale result ignored, gen=" + generation);
+                                return;
+                            }
                             callback.onResult(result.features, result.roads);
                         }
                     });
                 } catch (final Exception e) {
                     Log.w(TAG, "Overpass request failed", e);
                     // Если сеть недоступна — отдаём последний удачный кэш,
-                    // чтобы карта не оставалась пустой.
+                    // но только если он про текущее место: иначе под палец
+                    // попадают объекты другой точки («пустые места»).
                     final Result cached = loadCache();
                     main.post(new Runnable() {
                         @Override
                         public void run() {
-                            if (cached != null && (!cached.features.isEmpty() || !cached.roads.isEmpty())) {
+                            if (generation != fetchGeneration.get()) {
+                                return;
+                            }
+                            if (cached != null && cached.hasCenter
+                                    && cachedMatches(cached, lat, lon, radiusMeters)) {
+                                Log.i(TAG, "network failed, using cache for "
+                                        + roundStr(cached.centerLat) + "," + roundStr(cached.centerLon)
+                                        + " (delta " + (int) distanceMeters(cached.centerLat, cached.centerLon, lat, lon) + " m)");
                                 callback.onResult(cached.features, cached.roads);
                             } else {
                                 callback.onError(e);
@@ -132,6 +161,11 @@ public class OsmApiClient {
     private static class Result {
         final List<MapFeature> features = new ArrayList<>();
         final List<RoadInfo> roads = new ArrayList<>();
+        /** Официальный API OSM ответил (даже если объектов нет). */
+        boolean osmResponded = false;
+        /** Центр и радиус загрузки (для кэша): чтобы фолбэк отдавал объекты текущего места. */
+        boolean hasCenter = false;
+        double centerLat, centerLon, radiusMeters;
     }
 
     static String buildObjectsQuery(double lat, double lon, double radius) {
@@ -157,29 +191,22 @@ public class OsmApiClient {
     }
 
     private Result fetchAll(double lat, double lon, double radius) throws Exception {
+        if (Math.abs(lat) > 85.0 || Math.abs(lon) > 180.0) {
+            // За пределами области данных OpenStreetMap. Не дёргаем сеть:
+            // сервер ответит 400 на «неправильный» bbox, а Overpass будет
+            // ждать таймауты — пусть это будет честный пустой результат.
+            Log.w(TAG, "OSM: center outside map area, empty result");
+            Result empty = new Result();
+            empty.osmResponded = true;
+            return empty;
+        }
         Result result = fetchOnce(lat, lon, radius);
-        if (result != null && (!result.features.isEmpty() || !result.roads.isEmpty())) {
+        if (result.osmResponded || !result.features.isEmpty() || !result.roads.isEmpty()) {
+            // OSM ответил (в том числе пусто — так выглядит пустынная
+            // местность) либо нашлись объекты: это и есть правда.
             return result;
         }
-        // Публичный Overpass часто мигает 502 — даём ему вторую попытку.
-        try {
-            Thread.sleep(3000);
-        } catch (InterruptedException ignored) {
-        }
-        result = fetchOnce(lat, lon, radius);
-        if (result != null && (!result.features.isEmpty() || !result.roads.isEmpty())) {
-            return result;
-        }
-        // Последняя надежда: меньший радиус — ответ короче, серверу легче.
-        try {
-            Thread.sleep(2000);
-        } catch (InterruptedException ignored) {
-        }
-        result = fetchOnce(lat, lon, Math.max(400, radius * 0.5));
-        if (result != null && (!result.features.isEmpty() || !result.roads.isEmpty())) {
-            return result;
-        }
-        throw new Exception("Overpass empty response");
+        throw new Exception("OSM and Overpass unavailable");
     }
 
     private Result fetchOnce(double lat, double lon, double radius) {
@@ -195,6 +222,8 @@ public class OsmApiClient {
                 if (xml == null) {
                     continue;
                 }
+                // Хотя бы один тайл получен — OSM ответил, сеть в порядке.
+                r.osmResponded = true;
                 String json = apiXmlToJson(xml);
                 for (MapFeature f : parseObjects(json, lat, lon)) {
                     if (seen.add(f.type + "|" + f.name + "|"
@@ -219,30 +248,27 @@ public class OsmApiClient {
                 }
             }
             Log.i(TAG, "OSM API loaded features=" + r.features.size()
-                    + " roads=" + r.roads.size());
+                    + " roads=" + r.roads.size() + " responded=" + r.osmResponded);
         } catch (Exception e) {
             Log.w(TAG, "OSM API failed: " + e.getClass().getSimpleName() + ": " + e.getMessage(), e);
         }
-        // 2) Если OSM API пуст/недоступен — запасной вариант: Overpass.
-        if (r.features.isEmpty() && r.roads.isEmpty()) {
+        // 2) Запасной вариант — Overpass. Ходим в него только если OSM не
+        //    ответил вовсе (сеть/сервер). Пустая местность — это честный
+        //    ответ 200 «объектов нет», Overpass там бесполезен и только
+        //    подвесит загрузку на десятки секунд.
+        if (!r.osmResponded && r.features.isEmpty() && r.roads.isEmpty()) {
             String q1 = buildObjectsQuery(lat, lon, radius);
             String q2 = buildRoadsQuery(lat, lon, radius);
-            for (String endpoint : OVERPASS_ENDPOINTS) {
+            int tries = Math.min(2, OVERPASS_ENDPOINTS.length);
+            for (int i = 0; i < tries; i++) {
+                String endpoint = OVERPASS_ENDPOINTS[i];
                 try {
                     r.features.addAll(parseObjects(post(endpoint, q1), lat, lon));
-                    Log.i(TAG, "objects loaded from " + endpoint);
-                    break;
-                } catch (Exception e) {
-                    Log.w(TAG, "objects failed " + endpoint, e);
-                }
-            }
-            for (String endpoint : OVERPASS_ENDPOINTS) {
-                try {
                     r.roads.addAll(parseRoads(post(endpoint, q2)));
-                    Log.i(TAG, "roads loaded from " + endpoint);
+                    Log.i(TAG, "loaded from " + endpoint);
                     break;
                 } catch (Exception e) {
-                    Log.w(TAG, "roads failed " + endpoint, e);
+                    Log.w(TAG, "failed " + endpoint, e);
                 }
             }
         }
@@ -364,16 +390,24 @@ public class OsmApiClient {
         double cosLat = Math.cos(Math.toRadians(lat));
         double dLon = radius / (111320.0 * cosLat);
         requestsLeft.set(MAX_TILE_REQUESTS);
-        // Верхний уровень делим на 4 и грузим параллельно: даже в плотном
-        // центре это 4 запроса вместо последовательных, и карта заполняется
-        // по всему экрану, а не только вокруг центра.
-        double midLat = lat;
-        double midLon = lon;
+        // Зажимаем область в границы данных OSM: запрос «за краем» карты
+        // отвечает 400, а без зажима это превращается в каскад из 24
+        // запросов и загрузка «зависает».
+        double minLat = Math.max(-85.0, lat - dLat);
+        double maxLat = Math.min(85.0, lat + dLat);
+        double minLon = Math.max(-180.0, lon - dLon);
+        double maxLon = Math.min(180.0, lon + dLon);
+        if (minLat >= maxLat || minLon >= maxLon) {
+            Log.w(TAG, "OSM: requested area outside map bounds");
+            return new ArrayList<>();
+        }
+        double midLat = (minLat + maxLat) / 2.0;
+        double midLon = (minLon + maxLon) / 2.0;
         double[][] quads = {
-                {lat - dLat, lon - dLon, midLat, midLon},
-                {lat - dLat, midLon, midLat, lon + dLon},
-                {midLat, lon - dLon, lat + dLat, midLon},
-                {midLat, midLon, lat + dLat, lon + dLon}
+                {minLat, minLon, midLat, midLon},
+                {minLat, midLon, midLat, maxLon},
+                {midLat, minLon, maxLat, midLon},
+                {midLat, midLon, maxLat, maxLon}
         };
         List<Future<List<String>>> futures = new ArrayList<>();
         for (final double[] q : quads) {
@@ -389,7 +423,10 @@ public class OsmApiClient {
         List<String> out = new ArrayList<>();
         for (Future<List<String>> f : futures) {
             try {
-                out.addAll(f.get(90, TimeUnit.SECONDS));
+                // Таймауты уже ограничены OkHttp (connect 6 с, read 30 с);
+                // внешний get(90 с) на каждый квадрант складывался в 4×90 с
+                // и «замораживал» загрузку при плохой сети.
+                out.addAll(f.get());
             } catch (Exception e) {
                 Log.w(TAG, "OSM tile group failed: " + e.getMessage());
             }
@@ -586,8 +623,8 @@ public class OsmApiClient {
         HttpURLConnection conn = (HttpURLConnection) new URL(endpoint).openConnection();
         try {
             byte[] body = ("data=" + java.net.URLEncoder.encode(query, "UTF-8")).getBytes(StandardCharsets.UTF_8);
-            conn.setConnectTimeout(6000);
-            conn.setReadTimeout(30000);
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(12000);
             conn.setDoOutput(true);
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
@@ -879,6 +916,29 @@ public class OsmApiClient {
         return pts;
     }
 
+    /** Расстояние по прямой (метры) между двумя точками. */
+    private static double distanceMeters(double lat1, double lon1, double lat2, double lon2) {
+        double cosLat = Math.cos(Math.toRadians((lat1 + lat2) / 2.0));
+        double dLat = (lat2 - lat1) * 110574.0;
+        double dLon = (lon2 - lon1) * 111320.0 * cosLat;
+        return Math.hypot(dLat, dLon);
+    }
+
+    /** Кэш подходит текущему месту: центр близко и покрытие не меньше запрошенного. */
+    private static boolean cachedMatches(Result cached,
+                                         double lat, double lon, double radius) {
+        double delta = distanceMeters(cached.centerLat, cached.centerLon, lat, lon);
+        // Пользователь мог уехать максимум на 12% радиуса загрузки: офлайн-фолбэк
+        // всё ещё покрывает видимый квадрат. Дальше — объектов вокруг нет.
+        double maxDelta = Math.min(radius, cached.radiusMeters) * 0.12 + 60.0;
+        return delta <= maxDelta && cached.radiusMeters >= radius;
+    }
+
+    private static String roundStr(double v) {
+        return String.format(Locale.US, "%.5f", v);
+    }
+
+
     // ------------------------------------------------------------------
     // Офлайн-кэш последней успешной загрузки. Если Overpass недоступен,
     // приложение показывает и озвучивает последние объекты, а не пустоту.
@@ -887,9 +947,12 @@ public class OsmApiClient {
         return new File(appContext.getFilesDir(), "talkmap_cache.json");
     }
 
-    private void saveCache(Result result) {
+    private void saveCache(Result result, double lat, double lon, double radius) {
         try {
             JSONObject root = new JSONObject();
+            root.put("lat", lat);
+            root.put("lon", lon);
+            root.put("radius", radius);
             JSONArray arr = new JSONArray();
             for (MapFeature f : result.features) {
                 JSONObject o = new JSONObject();
@@ -931,6 +994,11 @@ public class OsmApiClient {
                 return null;
             }
             Result result = new Result();
+            result.centerLat = root.optDouble("lat", Double.NaN);
+            result.centerLon = root.optDouble("lon", Double.NaN);
+            result.radiusMeters = root.optDouble("radius", Double.NaN);
+            result.hasCenter = !Double.isNaN(result.centerLat) && !Double.isNaN(result.centerLon)
+                    && !Double.isNaN(result.radiusMeters);
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.optJSONObject(i);
                 if (o == null) {
@@ -941,7 +1009,9 @@ public class OsmApiClient {
                         o.optString("name", ""), o.optString("type", ""),
                         o.optString("spokenName", ""), o.optString("spokenType", "")));
             }
-            Log.i(TAG, "cache loaded, features=" + result.features.size());
+            Log.i(TAG, "cache loaded, features=" + result.features.size()
+                    + " center=" + result.centerLat + "," + result.centerLon
+                    + " radius=" + result.radiusMeters);
             return !result.features.isEmpty() ? result : null;
         } catch (Exception e) {
             Log.w(TAG, "cache load failed", e);
