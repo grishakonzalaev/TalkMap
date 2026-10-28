@@ -70,6 +70,7 @@ public class OsmApiClient {
     public static class RoadInfo {
         public final String name;
         public final List<GeoPoint> geometry = new ArrayList<>();
+        public int totalLengthMeters;
 
         RoadInfo(String name) {
             this.name = name;
@@ -820,7 +821,17 @@ public class OsmApiClient {
             for (int j = 0; j < geom.length(); j++) {
                 JSONObject g = geom.optJSONObject(j);
                 if (g != null) {
-                    road.geometry.add(new GeoPoint(g.optDouble("lat", 0), g.optDouble("lon", 0)));
+                    GeoPoint p = new GeoPoint(g.optDouble("lat", 0), g.optDouble("lon", 0));
+                    road.geometry.add(p);
+                    if (j > 0) {
+                        GeoPoint prev = road.geometry.get(j - 1);
+                        double cosLat = Math.cos(Math.toRadians((prev.getLatitude()
+                                + p.getLatitude()) / 2.0));
+                        double dLat = (p.getLatitude() - prev.getLatitude()) * 110574.0;
+                        double dLon = (p.getLongitude() - prev.getLongitude())
+                                * 111320.0 * cosLat;
+                        road.totalLengthMeters += Math.hypot(dLat, dLon);
+                    }
                 }
             }
             if (road.geometry.size() >= 2) {

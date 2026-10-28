@@ -55,11 +55,32 @@ public class MainActivity extends AppCompatActivity
         map.setListener(this);
 
         btnMyLocation.setOnClickListener(v -> {
+            // Если только что озвучена улица (обводка), а TalkMan держит фокус
+            // на кнопке — его «двойное нажатие» приходит сюда. Это клик по
+            // улице, а не по кнопке: включаем следование по улице.
+            if (map.handleStreetSelectionClick()) {
+                return;
+            }
             map.centerOnUser();
         });
-        btnZoomIn.setOnClickListener(v -> map.zoomIn());
-        btnZoomOut.setOnClickListener(v -> map.zoomOut());
-        btnZoomReset.setOnClickListener(v -> map.resetZoom());
+        btnZoomIn.setOnClickListener(v -> {
+            if (map.handleStreetSelectionClick()) {
+                return;
+            }
+            map.zoomIn();
+        });
+        btnZoomOut.setOnClickListener(v -> {
+            if (map.handleStreetSelectionClick()) {
+                return;
+            }
+            map.zoomOut();
+        });
+        btnZoomReset.setOnClickListener(v -> {
+            if (map.handleStreetSelectionClick()) {
+                return;
+            }
+            map.resetZoom();
+        });
 
         locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
 
@@ -204,6 +225,18 @@ public class MainActivity extends AppCompatActivity
     public void onStatus(int resId) {
         status.setText(resId);
         status.announceForAccessibility(getString(resId));
+    }
+
+    @Override
+    public void onLocationRequested() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+                || ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED) {
+            // Свежий фикс при каждом нажатии кнопки «моё местоположение»,
+            // а не сохранённая точка с момента запуска приложения.
+            requestSingleLocation();
+        }
     }
 
     @Override

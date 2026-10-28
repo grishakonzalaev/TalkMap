@@ -5,6 +5,7 @@ import android.graphics.Point;
 import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.view.HapticFeedbackConstants;
@@ -24,6 +25,7 @@ import org.osmdroid.views.Projection;
 import org.osmdroid.views.overlay.Marker;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -48,6 +50,9 @@ public class AccessibleMapView extends MapView {
         void onStatus(int resId);
 
         void onCount(int count);
+
+        /** Кнопка «моё местоположение»: повторить запрос свежего фикса. */
+        void onLocationRequested();
     }
 
     private final List<MapFeature> features = new ArrayList<>();
@@ -77,6 +82,53 @@ public class AccessibleMapView extends MapView {
     private long lastSpokenAt = 0;
     private String lastSpoken = "";
     private String lastStreetPhrase = null;
+    /** Момент последней озвучки улицы — перехват клика кнопки как выбора улицы. */
+    private long lastStreetPhraseAt = 0;
+    /** Имя улицы из последней озвученной фразы (без слов «с севера на юг»). */
+    private String lastStreetName = null;
+    /** Время первого перехваченного клика улицы — гашение второго клика пары TalkMan. */
+    private long lastConsumedStreetClickAt = 0;
+    /** Следование по улице: имя улицы, по которой едет карта. */
+    private String followedStreetName = null;
+    /** Сегменты (way) следуемой улицы. */
+    private final List<OsmApiClient.RoadInfo> followedSegments = new ArrayList<>();
+    /** Шаг одного жеста вдоль улицы, метры. */
+    private static final double FOLLOW_STEP_METERS = 350.0;
+    /** Радиус стыковки двух сегментов одной улицы, метры. */
+    private static final double CONTINUATION_TOLERANCE_METERS = 150.0;
+    /** Минимальный вектор жеста (px), чтобы считать его скроллом. */
+    private static final float FOLLOW_MIN_GESTURE_PX = 60f;
+    /** Косинус угла «вдоль улицы»: меньше — считаем поперёк. */
+    private static final double FOLLOW_ALIGN_COS = 0.5;
+    /** Состояние жеста в режиме следования. */
+    private float followTouchLastX;
+    private float followTouchLastY;
+    private float followTouchSumX;
+    private float followTouchSumY;
+    private boolean followTouchActive;
+    /** Жест уже обработан (один шаг на ACTION_UP), до конца жеста не повторяем. */
+    private boolean followGestureHandled;
+    /** Последняя точка обводки — для клика по проезжей части. */
+    private float lastHoverX = -1, lastHoverY = -1;
+    /** Последний одиночный тап — fallback, если hover-событие не дошло. */
+    private long lastTapUpTime;
+    private float lastTapX = -1, lastTapY = -1;
+    private float lastTapDownX = -1, lastTapDownY = -1;
+    private static final long DOUBLE_TAP_MS = 400L;
+    /** Окно пары кликов TalkMan: двойное нажатие может длиться до ~1.5 c. */
+    private static final long DOUBLE_CLICK_MS = 1500L;
+    /** Окно, в котором клик по кнопке считается выбором озвученной улицы.
+     *  Незрячему пользователю нужно время, чтобы убрать палец с карты,
+     *  нащупать кнопку/место и сделать двойной тап. 15 секунд покрывает
+     *  этот интервал без ложных срабатываний (после выбора окно закрывается). */
+    private static final long STREET_SELECTION_MS = 15000L;
+    private static final float DOUBLE_TAP_DIST_PX = 100f;
+    /**
+     * Модифицированный TalkBack (TalkMan) шлёт двойное нажатие как ДВА
+     * ACTION_CLICK подряд. Пара кликов по одному узлу = один логический клик.
+     */
+    private int lastClickNode = Integer.MIN_VALUE;
+    private long lastClickAt = 0;
 
     public AccessibleMapView(Context context) {
         super(context);
@@ -165,14 +217,19 @@ public class AccessibleMapView extends MapView {
         scheduleReload();
     }
 
-    /** Возвращает карту в точку текущего местоположения. */
+    /** Кнопка «моё местоположение»: запрашивает свежий фикс и двигает карту. */
     public void centerOnUser() {
+        // Не анимируем к сохранённой точке: она могла быть получена при
+        // запуске приложения, а пользователь уже переместился. Сначала
+        // запрашиваем свежий фикс; карта поедет к нему в setUserLocation.
         if (userLocation != null) {
-            getController().animateTo(userLocation);
-            String msg = "Карта возвращена к вашему местоположению.";
-            announceForAccessibility(msg);
+            announceForAccessibility("Запрашиваю ваше текущее местоположение…");
         } else {
             announceForAccessibility("Ваше местоположение ещё не определено.");
+        }
+        if (listener != null) {
+            Log.d(TAG, "centerOnUser -> request fresh fix");
+            listener.onLocationRequested();
         }
     }
 
@@ -195,6 +252,87 @@ public class AccessibleMapView extends MapView {
                 + " zoom=" + getZoomLevelDouble());
         scheduleReload();
         announceForAccessibility("Масштаб возвращён к исходному.");
+    }
+
+    /**
+     * Была ли озвучена улица в последние 4 секунды. TalkMan после озвучки
+     * улицы держит фокус на последней нажатой кнопке (зум/местоположение),
+     * виртуальные узлы он игнорирует, поэтому его двойной тап уходит кнопке.
+     * Если улица только что озвучена — клик любой кнопки считаем выбором
+     * этой улицы, а не нажатием кнопки.
+     */
+    public boolean isStreetRecentlySpoken() {
+        return lastStreetName != null && lastStreetPhraseAt > 0
+                && System.currentTimeMillis() - lastStreetPhraseAt <= STREET_SELECTION_MS;
+    }
+
+    /**
+     * Обработка клика кнопки (зум/местоположение) из MainActivity. Возвращает
+     * true, если клик уже обработан как выбор улицы (или как второй клик пары
+     * TalkMan) — кнопку выполнять не нужно.
+     */
+    public boolean handleStreetSelectionClick() {
+        long now = System.currentTimeMillis();
+        // TalkMan шлёт «двойное нажатие» как два ACTION_CLICK подряд.
+        // Первый клик пары мы превращаем в выбор улицы, второй обязан быть
+        // проглочен, иначе после включения следования зум сработает снова.
+        if (lastConsumedStreetClickAt > 0
+                && now - lastConsumedStreetClickAt <= DOUBLE_CLICK_MS) {
+            lastConsumedStreetClickAt = now;
+            Log.d(TAG, "button pair click consumed");
+            return true;
+        }
+        if (!isStreetRecentlySpoken()) {
+            return false;
+        }
+        lastConsumedStreetClickAt = now;
+        boolean ok = followLastStreet();
+        Log.d(TAG, "street selection click ok=" + ok);
+        // Даже если улица не загрузилась, кнопку не выполняем — пользователь
+        // целился в улицу, а не в зум.
+        return true;
+    }
+
+    /** Включает следование по последней озвученной улице. */
+    public boolean followLastStreet() {
+        if (!isStreetRecentlySpoken() || lastStreetName == null) {
+            return false;
+        }
+        String name = lastStreetName;
+        // Якорь — точка на улице, где палец был при обводке (а не GPS-позиция:
+        // она может быть в стороне, и карта уехала бы к ней).
+        GeoPoint anchor = null;
+        if (lastHoverX >= 0 && lastHoverY >= 0) {
+            for (OsmApiClient.RoadInfo r : roads) {
+                if (!name.equals(r.name)) {
+                    continue;
+                }
+                IGeoPoint proj = projectToRoad(r, lastHoverX, lastHoverY);
+                if (proj != null) {
+                    anchor = new GeoPoint(proj.getLatitude(), proj.getLongitude());
+                    break;
+                }
+            }
+        }
+        if (anchor == null) {
+            anchor = userLocation;
+        }
+        if (anchor == null) {
+            IGeoPoint center = getMapCenter();
+            if (center != null) {
+                anchor = new GeoPoint(center.getLatitude(), center.getLongitude());
+            }
+        }
+        boolean ok = tryFollowStreetName(name, anchor);
+        Log.d(TAG, "followLastStreet name=" + name + " ok=" + ok);
+        if (ok) {
+            // Один выбор = одно окно перехвата. После включения следования
+            // кнопки снова работают как обычно, иначе TalkMan не сможет
+            // изменить масштаб, пока мы не уедем с улицы.
+            lastStreetName = null;
+            lastStreetPhraseAt = 0;
+        }
+        return ok;
     }
 
     public void showNoLocation() {
@@ -249,6 +387,7 @@ public class AccessibleMapView extends MapView {
                             + " features, updating roads=" + newRoads.size());
                     roads.clear();
                     roads.addAll(newRoads);
+                    refreshFollowedSegments();
                     invalidate();
                 } else {
                     setFeatures(newFeatures, newRoads);
@@ -313,6 +452,9 @@ public class AccessibleMapView extends MapView {
         features.addAll(newFeatures);
         roads.clear();
         roads.addAll(newRoads);
+        // Если пользователь следует по улице — обновляем её геометрию,
+        // иначе при перезагрузке цепочка может остаться от старой загрузки.
+        refreshFollowedSegments();
         lastVirtualNode = -1;
         invalidate();
         // Сообщаем TalkBack, что содержимое изменилось.
@@ -570,6 +712,8 @@ public class AccessibleMapView extends MapView {
         switch (action) {
             case MotionEvent.ACTION_HOVER_ENTER:
             case MotionEvent.ACTION_HOVER_MOVE: {
+                lastHoverX = event.getX();
+                lastHoverY = event.getY();
                 MapFeature f = featureNear(event.getX(), event.getY());
                 if (f != null) {
                     int node = indexOfFeature(f);
@@ -582,8 +726,10 @@ public class AccessibleMapView extends MapView {
                     return true;
                 }
                 // Точечного объекта нет — возможно, палец на проезжей части улицы.
+                // Метод сам ставит фокус на виртуальный узел улицы: иначе TalkMan
+                // сохраняет фокус на последней кнопке (зум/местоположение) и
+                // двойной тап активирует кнопку, а не улицу.
                 if (announceStreetUnderFinger(event.getX(), event.getY())) {
-                    lastVirtualNode = -1;
                     return true;
                 }
                 if (lastVirtualNode >= 0) {
@@ -607,15 +753,151 @@ public class AccessibleMapView extends MapView {
         String phrase = streetPhraseAt(x, y);
         if (phrase == null) {
             lastStreetPhrase = null;
+            lastStreetName = null;
             return false;
         }
         if (!phrase.equals(lastStreetPhrase)) {
             lastStreetPhrase = phrase;
-            announceForAccessibility(phrase);
+            lastStreetPhraseAt = System.currentTimeMillis();
+            // Имя улицы без «с севера на юг» — для выбора по клику.
+            int cut = phrase.indexOf(" с ");
+            lastStreetName = cut > 0 ? phrase.substring(0, cut).trim() : phrase;
+            // Отправляем Events раньше, чем TalkMan их прочитает. Если
+            // после озвучки улицы придёт клик по кнопке (зум) — обработаем
+            // его как выбор этой улицы: TalkMan игнорирует виртуальные узлы,
+            // поэтому мы не можем дождаться performAction от узла.
+            int node = findStreetFeatureNode(phrase);
+            if (node >= 0) {
+                sendAccessibilityFocus(node);
+                if (node != lastVirtualNode) {
+                    lastVirtualNode = node;
+                    sendHoverEnter(node, phrase);
+                }
+            } else {
+                sendAccessibilityFocus(AccessibilityNodeProvider.HOST_VIEW_ID);
+                announceForAccessibility(phrase);
+            }
             performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
             Log.d(TAG, "street phrase=" + phrase);
         }
         return true;
+    }
+
+    /** Находит виртуальный узел улицы в features по имени из фразы. */
+    private int findStreetFeatureNode(String phrase) {
+        if (phrase == null) {
+            return -1;
+        }
+        // Фраза вида «Вертковская улица с севера на юг» — берём название до
+        // слова «с » («Вертковская улица») и ищем среди узлов type=street.
+        String namePart = phrase;
+        int cut = phrase.indexOf(" с ");
+        if (cut > 0) {
+            namePart = phrase.substring(0, cut).trim();
+        }
+        for (int i = 0; i < features.size(); i++) {
+            MapFeature f = features.get(i);
+            if ("street".equals(f.type)) {
+                String fn = (f.spokenName == null || f.spokenName.isEmpty()) ? f.name : f.spokenName;
+                if (fn != null && (fn.equalsIgnoreCase(namePart)
+                        || fn.toLowerCase().contains(namePart.toLowerCase())
+                        || namePart.toLowerCase().contains(fn.toLowerCase()))) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Режим следования: любые жесты (включая двухпальцевый скролл TalkMan)
+     * двигают карту только если их направление совпадает с улицей.
+     * Поперёк улицы и за её концом — карта не едет.
+     */
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        long now = SystemClock.uptimeMillis();
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                lastTapDownX = event.getX();
+                lastTapDownY = event.getY();
+                if (followedStreetName == null && now - lastTapUpTime <= DOUBLE_TAP_MS
+                        && Math.hypot(event.getX() - lastTapX, event.getY() - lastTapY)
+                                < DOUBLE_TAP_DIST_PX) {
+                    Log.d(TAG, "doubleTap x=" + event.getX() + " y=" + event.getY());
+                    if (tryFollowStreetAt(event.getX(), event.getY())) {
+                        lastTapUpTime = 0;
+                        return true;
+                    }
+                }
+                break;
+            case MotionEvent.ACTION_UP:
+                lastTapUpTime = now;
+                lastTapX = event.getX();
+                lastTapY = event.getY();
+                break;
+            default:
+                break;
+        }
+        if (followedStreetName == null) {
+            return super.onTouchEvent(event);
+        }
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                followTouchLastX = event.getX(0);
+                followTouchLastY = event.getY(0);
+                followTouchSumX = 0;
+                followTouchSumY = 0;
+                followTouchActive = true;
+                followGestureHandled = false;
+                return true;
+            case MotionEvent.ACTION_MOVE: {
+                if (!followTouchActive || followedChain.size() < 2) {
+                    return super.onTouchEvent(event);
+                }
+                int n = event.getPointerCount();
+                float avgX = 0, avgY = 0;
+                for (int i = 0; i < n; i++) {
+                    avgX += event.getX(i);
+                    avgY += event.getY(i);
+                }
+                avgX /= n;
+                avgY /= n;
+                followTouchSumX += avgX - followTouchLastX;
+                followTouchSumY += avgY - followTouchLastY;
+                followTouchLastX = avgX;
+                followTouchLastY = avgY;
+                // Один жест — один шаг. После первого срабатывания
+                // остальные MOVE этого жеста не двигают карту снова
+                // (иначе за свайп проезжается 2 шага и улица "заканчивается").
+                if (!followGestureHandled
+                        && Math.hypot(followTouchSumX, followTouchSumY) >= FOLLOW_MIN_GESTURE_PX) {
+                    followGestureHandled = true;
+                    scrollGestureAlongStreet(followTouchSumX, followTouchSumY);
+                    followTouchSumX = 0;
+                    followTouchSumY = 0;
+                    return true;
+                }
+                // Жест не по направлению улицы тоже полностью перехватываем:
+                // если вернуть false, osmdroid проскроллит карту вбок.
+                return true;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
+            case MotionEvent.ACTION_CANCEL:
+                followTouchActive = false;
+                followTouchSumX = 0;
+                followTouchSumY = 0;
+                followGestureHandled = false;
+                lastTapUpTime = now;
+                lastTapX = event.getX();
+                lastTapY = event.getY();
+                return true;
+            default:
+                return super.onTouchEvent(event);
+        }
     }
 
     private void sendHoverEnter(int nodeId, String phrase) {
@@ -635,6 +917,35 @@ public class AccessibleMapView extends MapView {
         Log.d(TAG, "sendHoverEnter node=" + nodeId + " phrase=" + phrase);
         lastSpoken = phrase;
         lastSpokenAt = System.currentTimeMillis();
+    }
+
+    /**
+     * Явный перенос accessibility-фокуса на узел. Модифицированный TalkBack
+     * (TalkMan) игнорирует hover виртуальных узлов и держит фокус на
+     * последнем реальном элементе (кнопка зума/местоположения), поэтому
+     * двойной тап уходит кнопке. TYPE_VIEW_ACCESSIBILITY_FOCUSED
+     * побуждает его переключить фокус на узел.
+     */
+    private void sendAccessibilityFocus(int nodeId) {
+        if (nodeId < 0) {
+            return;
+        }
+        AccessibilityEvent event = AccessibilityEvent.obtain(
+                AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED);
+        event.setSource(this, nodeId);
+        event.setClassName(MapView.class.getName());
+        event.setPackageName(getContext().getPackageName());
+        event.setContentDescription(nodeId == AccessibilityNodeProvider.HOST_VIEW_ID
+                ? getResources().getString(R.string.map_description) : "");
+        if (nodeId >= 0 && nodeId < features.size()) {
+            MapFeature f = features.get(nodeId);
+            if (f != null) {
+                event.setContentDescription(phraseFor(f));
+            }
+        }
+        event.getText().add(event.getContentDescription());
+        sendAccessibilityEventUnchecked(event);
+        Log.d(TAG, "sendAccessibilityFocus node=" + nodeId);
     }
 
     private void sendHoverExit() {
@@ -675,7 +986,7 @@ public class AccessibleMapView extends MapView {
             info.setClassName(MapView.class.getName());
             info.setFocusable(true);
             info.setEnabled(true);
-            info.setClickable(false);
+            info.setClickable(true);
             Log.d(TAG, "createNode id=" + virtualViewId + " features=" + features.size());
 
             if (virtualViewId == AccessibilityNodeProvider.HOST_VIEW_ID) {
@@ -691,6 +1002,8 @@ public class AccessibleMapView extends MapView {
                 // Позволяем скринридеру «сдвигать» карту свайпами.
                 info.addAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
                 info.addAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD);
+                // Клик по карте (пустому месту) — тоже вход в следование.
+                info.addAction(AccessibilityNodeInfo.ACTION_CLICK);
                 return info;
             }
 
@@ -702,7 +1015,10 @@ public class AccessibleMapView extends MapView {
             String phrase = phraseFor(f);
             info.setContentDescription(phrase);
             info.setText(phrase);
-            info.setVisibleToUser(isOnScreen(f));
+            // Улица всегда «видима» в рамках загруженного радиуса: её узел —
+            // точка на линии дороги, и по isOnScreen он мог быть за экраном,
+            // из-за чего TalkMan не мог на него сфокусироваться.
+            info.setVisibleToUser("street".equals(f.type) ? true : isOnScreen(f));
             info.setBoundsInScreen(boundsFor(f));
             info.addAction(AccessibilityNodeInfo.ACTION_CLICK);
             return info;
@@ -710,7 +1026,85 @@ public class AccessibleMapView extends MapView {
 
         @Override
         public boolean performAction(int virtualViewId, int action, android.os.Bundle arguments) {
+            Log.d(TAG, "performAction id=" + virtualViewId + " action=" + action
+                    + " follow=" + followedStreetName);
+            long now = SystemClock.uptimeMillis();
+            if (action == AccessibilityNodeInfo.ACTION_CLICK) {
+                // TalkMan (модифицированный TalkBack) шлёт «двойное нажатие»
+                // как ДВА ACTION_CLICK подряд. Второй клик пары гасим:
+                // действие выполняет первый. Одиночный клик стандартного
+                // TalkBack тоже работает (первый клик пары). Узел второй
+                // пары может быть соседним (TalkMan сдвигает фокус) —
+                // гасим по времени, а не по совпадению id.
+                boolean pairSecond = now - lastClickAt > 0
+                        && now - lastClickAt <= DOUBLE_CLICK_MS;
+                if (pairSecond) {
+                    lastClickNode = Integer.MIN_VALUE;
+                    // Не сбрасываем время в 0: все клики в окне пары гасятся,
+                    // иначе третий клик TalkMan снова включит/выключит.
+                    lastClickAt = now;
+                    Log.d(TAG, "pair click consumed node=" + virtualViewId);
+                    return true;
+                }
+                lastClickNode = virtualViewId;
+                lastClickAt = now;
+
+                MapFeature f = featureById(virtualViewId);
+                if (virtualViewId == AccessibilityNodeProvider.HOST_VIEW_ID) {
+                    if (followedStreetName != null) {
+                        detachFollowStreet("Следование по улице "
+                                + followedStreetName + " отключено.");
+                        return true;
+                    }
+                    if (lastHoverX >= 0) {
+                        tryFollowStreetAt(lastHoverX, lastHoverY);
+                    }
+                    return true;
+                }
+                // Узел улицы: включаем/выключаем следование ИМЕННО по ней —
+                // не по ближайшей дороге (на перекрёстке может оказаться
+                // поперечный переулок).
+                if (f != null && "street".equals(f.type)) {
+                    toggleFollowStreet(f);
+                    return true;
+                }
+                // Дом/остановка на проезжей части: сначала пробуем улицу по
+                // ИМЕНИ узла («улица Станиславского, дом 24» → «улица
+                // Станиславского»). Так пользователь всегда попадает на улицу
+                // из адреса, а не на поперечный переулок поблизости.
+                if (f != null && followedStreetName == null) {
+                    String fromName = streetNameOf(f);
+                    if (fromName != null
+                            && tryFollowStreetName(fromName, new GeoPoint(f.lat, f.lon))) {
+                        return true;
+                    }
+                    getProjection().toPixels(new GeoPoint(f.lat, f.lon), tmpPoint);
+                    if (roadNear(tmpPoint.x, tmpPoint.y) != null
+                            && tryFollowStreetAt(tmpPoint.x, tmpPoint.y)) {
+                        return true;
+                    }
+                }
+                if (f != null) {
+                    announceCustom(phraseFor(f), virtualViewId);
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                }
+                return true;
+            }
             if (virtualViewId == AccessibilityNodeProvider.HOST_VIEW_ID) {
+                if (followedStreetName != null) {
+                    // Как при обычном перетаскивании карты: свайп вверх
+                    // (SCROLL_FORWARD) показывает юг, свайп вниз
+                    // (SCROLL_BACKWARD) — север. Направление вдоль улицы
+                    // определяем по географическому вектору, независимо
+                    // от порядка точек в цепочке.
+                    if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) {
+                        return moveAlongStreetGeo(0.0, -1.0);
+                    }
+                    if (action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) {
+                        return moveAlongStreetGeo(0.0, 1.0);
+                    }
+                    return false;
+                }
                 if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) {
                     IGeoPoint c = getMapCenter();
                     getController().setCenter(new GeoPoint(c.getLatitude()
@@ -724,14 +1118,6 @@ public class AccessibleMapView extends MapView {
                     return true;
                 }
                 return false;
-            }
-            if (action == AccessibilityNodeInfo.ACTION_CLICK) {
-                MapFeature f = featureById(virtualViewId);
-                if (f != null) {
-                    announceCustom(phraseFor(f), virtualViewId);
-                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                    return true;
-                }
             }
             return false;
         }
@@ -760,6 +1146,576 @@ public class AccessibleMapView extends MapView {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Следование по улице: двойное нажатие на улицу, затем свайпы
+    // вперёд/назад двигают карту ВДОЛЬ улицы, не давая ей уйти с центра.
+    // Свайпы поперёк улицы и конец улицы — движения нет.
+    // ------------------------------------------------------------------
+    /** Геометрия следуемой улицы, склеенная из сегментов в одну линию. */
+    private final List<GeoPoint> followedChain = new ArrayList<>();
+    /** Точка клика (якорь) для сборки цепочки от места нажатия. */
+    private double followAnchorLat = Double.NaN;
+    private double followAnchorLon = Double.NaN;
+
+    /** Находит улицу под точкой обводки и включает следование по ней. */
+    private boolean tryFollowStreetAt(float x, float y) {
+        OsmApiClient.RoadInfo road = roadNear(x, y);
+        Log.d(TAG, "tryFollowStreetAt x=" + x + " y=" + y
+                + " road=" + (road == null ? "null" : road.name)
+                + " hover=" + lastHoverX + "," + lastHoverY);
+        if (road == null || road.name == null || road.name.isEmpty()) {
+            return false;
+        }
+        IGeoPoint projPre = projectToRoad(road, x, y);
+        if (projPre != null) {
+            followAnchorLat = projPre.getLatitude();
+            followAnchorLon = projPre.getLongitude();
+        }
+        List<OsmApiClient.RoadInfo> segs = new ArrayList<>();
+        for (OsmApiClient.RoadInfo r : roads) {
+            if (road.name.equals(r.name)) {
+                segs.add(r);
+            }
+        }
+        if (segs.isEmpty()) {
+            return false;
+        }
+        followedStreetName = road.name;
+        followedSegments.clear();
+        followedSegments.addAll(segs);
+        rebuildFollowedChain();
+        if (followedChain.size() < 2) {
+            detachFollowStreet("Геометрия улицы " + road.name + " слишком короткая.");
+            return true;
+        }
+        // Центрируем на точке обводки на проезжей части.
+        IGeoPoint proj = projectToRoad(road, x, y);
+        if (proj != null) {
+            getController().setCenter(new GeoPoint(proj.getLatitude(), proj.getLongitude()));
+        }
+        announceForAccessibility("Следование по улице " + road.name + " включено. "
+                + "Направление улицы: " + streetAxisName() + ". "
+                + "Свайпы в этом направлении двигают карту, поперёк — нет. "
+                + "Нажмите снова на улицу, чтобы отключить.");
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+        return true;
+    }
+
+    private void toggleFollowStreet(MapFeature f) {
+        String name = (f.spokenName == null || f.spokenName.isEmpty()) ? f.name : f.spokenName;
+        if (tryFollowStreetName(name, new GeoPoint(f.lat, f.lon))) {
+            return;
+        }
+        announceForAccessibility("Не удалось следовать по улице " + name
+                + ": её геометрия не загружена.");
+    }
+
+    /** Пробует включить следование по улице с таким именем. */
+    private boolean tryFollowStreetName(String name, GeoPoint anchor) {
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        if (followedStreetName != null && followedStreetName.equals(name)) {
+            detachFollowStreet("Следование по улице " + name + " отключено.");
+            return true;
+        }
+        List<OsmApiClient.RoadInfo> segs = new ArrayList<>();
+        for (OsmApiClient.RoadInfo r : roads) {
+            if (name.equals(r.name)) {
+                segs.add(r);
+            }
+        }
+        if (segs.isEmpty()) {
+            return false;
+        }
+        followAnchorLat = anchor.getLatitude();
+        followAnchorLon = anchor.getLongitude();
+        followedStreetName = name;
+        followedSegments.clear();
+        followedSegments.addAll(segs);
+        rebuildFollowedChain();
+        if (followedChain.size() < 2) {
+            detachFollowStreet("Геометрия улицы " + name + " слишком короткая.");
+            return true;
+        }
+        if (anchor != null) {
+            getController().setCenter(anchor);
+        }
+        // Двойная вибрация: TalkMan-звук может не озвучить announcement,
+        // а короткий «двойной щелчок» всегда ощутим.
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+            }
+        }, 120);
+        announceForAccessibility("Следование по улице " + name + " включено. "
+                + "Направление улицы: " + streetAxisName() + ". "
+                + "Свайпы в этом направлении двигают карту, поперёк — нет. "
+                + "Нажмите снова на улицу, чтобы отключить.");
+        Log.d(TAG, "follow started name=" + name + " segs=" + segs.size()
+                + " chain=" + followedChain.size());
+        return true;
+    }
+
+    /**
+     * Имя улицы из узла-адреса: «улица Станиславского, дом 24» → «улица
+     * Станиславского», «Вертковская улица, дом 40» → «Вертковская улица».
+     */
+    private String streetNameOf(MapFeature f) {
+        String name = (f.spokenName == null || f.spokenName.isEmpty()) ? f.name : f.spokenName;
+        if (name == null) {
+            return null;
+        }
+        String lower = name.toLowerCase();
+        int cut = name.indexOf(',');
+        String prefix = cut > 0 ? name.substring(0, cut).trim() : name;
+        if (prefix.isEmpty()) {
+            return null;
+        }
+        for (OsmApiClient.RoadInfo r : roads) {
+            if (r.name.equals(prefix)) {
+                return r.name;
+            }
+            if (r.name.equalsIgnoreCase(prefix)) {
+                return r.name;
+            }
+            if (r.name.toLowerCase().contains(prefix.toLowerCase())
+                    || prefix.toLowerCase().contains(r.name.toLowerCase())) {
+                return r.name;
+            }
+        }
+        return null;
+    }
+
+    private void detachFollowStreet(String message) {
+        followedStreetName = null;
+        followedSegments.clear();
+        followedChain.clear();
+        announceForAccessibility(message);
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+    }
+
+    /** Пересобирает линию улицы из свежих сегментов после перезагрузки. */
+    private void refreshFollowedSegments() {
+        if (followedStreetName == null) {
+            return;
+        }
+        // При каждом сдвиге карты API возвращает дороги только своего
+        // радиуса, и если просто заменить followedSegments — цепочка улицы
+        // сжимается, а следование «заканчивается» на середине улицы.
+        // Известные сегменты НАКАПЛИВАЕМ: добавляем новые, которых ещё нет.
+        IGeoPoint center = getMapCenter();
+        if (center != null) {
+            followAnchorLat = center.getLatitude();
+            followAnchorLon = center.getLongitude();
+        }
+        for (OsmApiClient.RoadInfo r : roads) {
+            if (!followedStreetName.equals(r.name) || r.geometry.size() < 2) {
+                continue;
+            }
+            boolean known = false;
+            for (OsmApiClient.RoadInfo old : followedSegments) {
+                if (sameRoadSegment(old, r)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                followedSegments.add(r);
+            }
+        }
+        rebuildFollowedChain();
+    }
+
+    /** Два сегмента считаем одним и тем же, если совпадают концы геометрии. */
+    private boolean sameRoadSegment(OsmApiClient.RoadInfo a, OsmApiClient.RoadInfo b) {
+        if (a.geometry.isEmpty() || b.geometry.isEmpty()) {
+            return false;
+        }
+        GeoPoint a0 = a.geometry.get(0);
+        GeoPoint a1 = a.geometry.get(a.geometry.size() - 1);
+        GeoPoint b0 = b.geometry.get(0);
+        GeoPoint b1 = b.geometry.get(b.geometry.size() - 1);
+        return (distanceMeters(a0, b0) < 1.0 && distanceMeters(a1, b1) < 1.0)
+                || (distanceMeters(a0, b1) < 1.0 && distanceMeters(a1, b0) < 1.0);
+    }
+
+    private void rebuildFollowedChain() {
+        followedChain.clear();
+        if (followedSegments.isEmpty()) {
+            return;
+        }
+        // Начинаем с сегмента, ближайшего к точке клика/центру. Тогда
+        // цепочка всегда «растёт» от места, где стоит пользователь, и не
+        // зависит от порядка сегментов в ответе API.
+        List<OsmApiClient.RoadInfo> remaining = new ArrayList<>(followedSegments);
+        int startIdx = 0;
+        if (!Double.isNaN(followAnchorLon)) {
+            double best = Double.MAX_VALUE;
+            for (int i = 0; i < remaining.size(); i++) {
+                GeoPoint p = remaining.get(i).geometry.get(0);
+                double d = distanceMeters(p,
+                        new GeoPoint(followAnchorLat, followAnchorLon));
+                if (d < best) {
+                    best = d;
+                    startIdx = i;
+                }
+            }
+        }
+        List<GeoPoint> chain = new ArrayList<>(remaining.remove(startIdx).geometry);
+        boolean added = true;
+        int guard = 0;
+        while (added && !remaining.isEmpty() && guard < 400) {
+            added = false;
+            guard++;
+            GeoPoint head = chain.get(0);
+            GeoPoint tail = chain.get(chain.size() - 1);
+            int bestIdx = -1;
+            int bestMode = -1; // 0: rn->tail, 1: r0->tail, 2: r0->head, 3: rn->head
+            double bestDist = Double.MAX_VALUE;
+            for (int i = 0; i < remaining.size(); i++) {
+                OsmApiClient.RoadInfo r = remaining.get(i);
+                GeoPoint r0 = r.geometry.get(0);
+                GeoPoint rn = r.geometry.get(r.geometry.size() - 1);
+                double d0 = distanceMeters(rn, tail);
+                double d1 = distanceMeters(r0, tail);
+                double d2 = distanceMeters(r0, head);
+                double d3 = distanceMeters(rn, head);
+                if (d0 <= CONTINUATION_TOLERANCE_METERS && d0 < bestDist) {
+                    bestDist = d0; bestIdx = i; bestMode = 0;
+                }
+                if (d1 <= CONTINUATION_TOLERANCE_METERS && d1 < bestDist) {
+                    bestDist = d1; bestIdx = i; bestMode = 1;
+                }
+                if (d2 <= CONTINUATION_TOLERANCE_METERS && d2 < bestDist) {
+                    bestDist = d2; bestIdx = i; bestMode = 2;
+                }
+                if (d3 <= CONTINUATION_TOLERANCE_METERS && d3 < bestDist) {
+                    bestDist = d3; bestIdx = i; bestMode = 3;
+                }
+            }
+            if (bestIdx < 0) {
+                break;
+            }
+            OsmApiClient.RoadInfo r = remaining.get(bestIdx);
+            switch (bestMode) {
+                case 0:
+                    chain.addAll(r.geometry);
+                    break;
+                case 1: {
+                    List<GeoPoint> rev = new ArrayList<>(r.geometry);
+                    Collections.reverse(rev);
+                    chain.addAll(rev);
+                    break;
+                }
+                case 2: {
+                    List<GeoPoint> rev = new ArrayList<>(r.geometry);
+                    Collections.reverse(rev);
+                    chain.addAll(0, rev);
+                    break;
+                }
+                default:
+                    chain.addAll(0, r.geometry);
+                    break;
+            }
+            remaining.remove(bestIdx);
+            added = true;
+        }
+        followedChain.addAll(chain);
+        Log.d(TAG, "followedChain name=" + followedStreetName + " pts=" + chain.size()
+                + " head=" + (chain.isEmpty() ? "-" : chain.get(0).getLatitude() + "," + chain.get(0).getLongitude())
+                + " tail=" + (chain.isEmpty() ? "-" : chain.get(chain.size() - 1).getLatitude() + "," + chain.get(chain.size() - 1).getLongitude())
+                + " remain=" + remaining.size());
+    }
+
+    /**
+     * Движение одним жестом: dir +1 — к концу улицы, -1 — к началу.
+     * Если улица закончилась, карта не едет и следование снимается.
+     */
+    private boolean moveAlongStreet(int dir) {
+        Log.d(TAG, "moveAlongStreet dir=" + dir + " name=" + followedStreetName
+                + " chain=" + followedChain.size() + " axis=" + streetAxisName());
+        if (followedChain.size() < 2) {
+            Log.d(TAG, "detachFollowStreet: chain<2, name=" + followedStreetName);
+            announceForAccessibility("Улица " + followedStreetName
+                    + " больше не загружена. Следование остановлено.");
+            detachFollowStreetSilently();
+            return true;
+        }
+        IGeoPoint center = getMapCenter();
+        if (center == null) {
+            return false;
+        }
+        double s0 = arcLengthOfNearestPoint(center);
+        double total = chainLength();
+        double target = dir > 0 ? s0 + FOLLOW_STEP_METERS : s0 - FOLLOW_STEP_METERS;
+        if (target < 0 || target > total) {
+            Log.d(TAG, "detachFollowStreet: end dir=" + dir + " s0=" + (int) s0
+                    + " total=" + (int) total + " name=" + followedStreetName);
+            announceForAccessibility("Улица закончилась. Следование остановлено.");
+            detachFollowStreetSilently();
+            return true;
+        }
+        GeoPoint p = pointAtArcLength(target);
+        if (p == null) {
+            return false;
+        }
+        getController().setCenter(p);
+        scheduleReload();
+        return true;
+    }
+
+    /**
+     * Движение по улице с географически заданным направлением центра карты:
+     * gx — метры на восток, gy — метры на север. Направление определяем по
+     * касательной ближайшего к центру сегмента, поэтому оно не зависит от
+     * порядка точек в followedChain (у OSM он произвольный). Как при обычном
+     * перетаскивании карты: свайп вниз показывает север, вверх — юг,
+     * вправо — запад, влево — восток.
+     */
+    private boolean moveAlongStreetGeo(double gx, double gy) {
+        if (followedChain.size() < 2) {
+            return false;
+        }
+        IGeoPoint center = getMapCenter();
+        if (center == null) {
+            return false;
+        }
+        double refLat = followedChain.get(0).getLatitude();
+        double cosLat = Math.cos(Math.toRadians(refLat));
+        double cx = center.getLongitude() * 111320.0 * cosLat;
+        double cy = center.getLatitude() * 110574.0;
+        double bestDist = Double.MAX_VALUE;
+        double bestTx = 0, bestTy = 0;
+        for (int i = 0; i + 1 < followedChain.size(); i++) {
+            GeoPoint a = followedChain.get(i);
+            GeoPoint b = followedChain.get(i + 1);
+            double ax = a.getLongitude() * 111320.0 * cosLat;
+            double ay = a.getLatitude() * 110574.0;
+            double bx = b.getLongitude() * 111320.0 * cosLat;
+            double by = b.getLatitude() * 110574.0;
+            double vx = bx - ax, vy = by - ay;
+            double len2 = vx * vx + vy * vy;
+            if (len2 <= 0) {
+                continue;
+            }
+            double t = ((cx - ax) * vx + (cy - ay) * vy) / len2;
+            t = Math.max(0.0, Math.min(1.0, t));
+            double qx = ax + t * vx, qy = ay + t * vy;
+            double d = Math.hypot(cx - qx, cy - qy);
+            if (d < bestDist) {
+                bestDist = d;
+                bestTx = vx / Math.sqrt(len2);
+                bestTy = vy / Math.sqrt(len2);
+            }
+        }
+        double along = gx * bestTx + gy * bestTy;
+        if (Math.abs(along) < 1e-6) {
+            Log.d(TAG, "moveAlongStreetGeo: perpendicular only (" + (int) gx
+                    + "," + (int) gy + ")");
+            return false;
+        }
+        return moveAlongStreet(along >= 0 ? +1 : -1);
+    }
+
+    /**
+     * Движение жестом по направлению улицы. dx/dy — вектор жеста в
+     * экранных пикселях (положительный dy = вниз). Улица должна иметь
+     * доминирующую ось; проекция вектора на улицу должна быть не меньше
+     * поперечной составляющей. Иначе жест игнорируется.
+     */
+    private boolean scrollGestureAlongStreet(float dx, float dy) {
+        if (followedChain.size() < 2) {
+            return false;
+        }
+        double len = Math.hypot(dx, dy);
+        if (len < FOLLOW_MIN_GESTURE_PX) {
+            return false;
+        }
+        double ang = localStreetAngle();
+        double cosA = Math.cos(ang), sinA = Math.sin(ang);
+        // Вектор жеста в «долгота/широта»: как при обычном перетаскивании
+        // карта движется ПРОТИВ пальца — свайп вниз (dy>0) показывает север,
+        // свайп вправо (dx>0) показывает запад. Поэтому gy = +dy, gx = -dx.
+        double gx = -dx, gy = dy;
+        double along = gx * cosA + gy * sinA;
+        double across = -gx * sinA + gy * cosA;
+        if (Math.abs(along) < Math.abs(across) * FOLLOW_ALIGN_COS) {
+            Log.d(TAG, "gesture ignored: across=" + (int) across + " along=" + (int) along);
+            return false;
+        }
+        return moveAlongStreetGeo(gx, gy);
+    }
+
+    private void detachFollowStreetSilently() {
+        followedStreetName = null;
+        followedSegments.clear();
+        followedChain.clear();
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+    }
+
+    /** Расстояние по прямой (метры) между двумя точками. */
+    private static double distanceMeters(GeoPoint a, GeoPoint b) {
+        double cosLat = Math.cos(Math.toRadians((a.getLatitude() + b.getLatitude()) / 2.0));
+        double dLat = (b.getLatitude() - a.getLatitude()) * 110574.0;
+        double dLon = (b.getLongitude() - a.getLongitude()) * 111320.0 * cosLat;
+        return Math.hypot(dLat, dLon);
+    }
+
+    private OsmApiClient.RoadInfo roadNear(float x, float y) {
+        OsmApiClient.RoadInfo best = null;
+        double bestScore = Double.MAX_VALUE;
+        double maxDist = streetRadiusPx() * 1.5;
+        for (OsmApiClient.RoadInfo road : roads) {
+            double roadLen = namedRoadLength(road.name);
+            for (int i = 0; i + 1 < road.geometry.size(); i++) {
+                double[] proj = projectToScreen(road.geometry.get(i), road.geometry.get(i + 1), x, y);
+                if (proj != null && proj[2] < maxDist) {
+                    double distance = proj[2];
+                    double score = distance * Math.max(1.0, 60.0 / Math.sqrt(roadLen));
+                    if (score < bestScore) {
+                        bestScore = score;
+                        best = road;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Суммарная длина всех сегментов улицы с данным именем, метры. */
+    private double namedRoadLength(String name) {
+        double total = 0;
+        for (OsmApiClient.RoadInfo r : roads) {
+            if (name.equals(r.name)) {
+                total += r.totalLengthMeters;
+            }
+        }
+        return Math.max(total, 100.0);
+    }
+
+    /** Проекция точки обводки на геометрию дороги (lat/lon). */
+    private IGeoPoint projectToRoad(OsmApiClient.RoadInfo road, float x, float y) {
+        double bestDist = Double.MAX_VALUE;
+        double bestLat = Double.NaN, bestLon = Double.NaN;
+        for (int i = 0; i + 1 < road.geometry.size(); i++) {
+            double[] proj = projectToScreen(road.geometry.get(i), road.geometry.get(i + 1), x, y);
+            if (proj != null && proj[2] < bestDist) {
+                bestDist = proj[2];
+                bestLat = proj[7];
+                bestLon = proj[8];
+            }
+        }
+        if (Double.isNaN(bestLat)) {
+            return null;
+        }
+        return new GeoPoint(bestLat, bestLon);
+    }
+
+    /** Название доминирующего направления улицы для подсказки. */
+    private String streetAxisName() {
+        double metersN = 0, metersE = 0;
+        double refLat = followedChain.get(0).getLatitude();
+        double cosLat = Math.cos(Math.toRadians(refLat));
+        for (int i = 0; i + 1 < followedChain.size(); i++) {
+            GeoPoint a = followedChain.get(i);
+            GeoPoint b = followedChain.get(i + 1);
+            metersN += Math.abs(b.getLatitude() - a.getLatitude()) * 110574.0;
+            metersE += Math.abs(b.getLongitude() - a.getLongitude())
+                    * 111320.0 * cosLat;
+        }
+        return metersN >= metersE ? "с севера на юг" : "с запада на восток";
+    }
+
+    /** Угол главной оси улицы в экранных координатах (радианы). */
+    private double localStreetAngle() {
+        double refLat = followedChain.get(0).getLatitude();
+        double cosLat = Math.cos(Math.toRadians(refLat));
+        double sx = 0, sy = 0;
+        for (int i = 0; i + 1 < followedChain.size(); i++) {
+            GeoPoint a = followedChain.get(i);
+            GeoPoint b = followedChain.get(i + 1);
+            double ex = (b.getLongitude() - a.getLongitude()) * 111320.0 * cosLat;
+            double ny = (b.getLatitude() - a.getLatitude()) * 110574.0;
+            double len = Math.hypot(ex, ny);
+            if (len < 1e-6) {
+                continue;
+            }
+            sx += ex / len;
+            sy += ny / len;
+        }
+        return Math.atan2(sy, sx);
+    }
+
+    private double chainLength() {
+        double total = 0;
+        for (int i = 0; i + 1 < followedChain.size(); i++) {
+            total += distanceMeters(followedChain.get(i), followedChain.get(i + 1));
+        }
+        return total;
+    }
+
+    /** Длина дуги от начала улицы до ближайшей к центру точки. */
+    private double arcLengthOfNearestPoint(IGeoPoint center) {
+        double cx = center.getLongitude();
+        double cy = center.getLatitude();
+        double best = Double.MAX_VALUE;
+        double bestS = 0;
+        double s = 0;
+        double refLat = followedChain.get(0).getLatitude();
+        double cosLat = Math.cos(Math.toRadians(refLat));
+        for (int i = 0; i + 1 < followedChain.size(); i++) {
+            GeoPoint a = followedChain.get(i);
+            GeoPoint b = followedChain.get(i + 1);
+            double ax = a.getLongitude() * 111320.0 * cosLat;
+            double ay = a.getLatitude() * 110574.0;
+            double bx = b.getLongitude() * 111320.0 * cosLat;
+            double by = b.getLatitude() * 110574.0;
+            double px = center.getLongitude() * 111320.0 * cosLat;
+            double py = center.getLatitude() * 110574.0;
+            double vx = bx - ax, vy = by - ay;
+            double len2 = vx * vx + vy * vy;
+            if (len2 <= 0) {
+                continue;
+            }
+            double t = ((px - ax) * vx + (py - ay) * vy) / len2;
+            t = Math.max(0.0, Math.min(1.0, t));
+            double qx = ax + t * vx, qy = ay + t * vy;
+            double d = Math.hypot(px - qx, py - qy);
+            if (d < best) {
+                best = d;
+                bestS = s + t * Math.sqrt(len2);
+            }
+            s += Math.sqrt(len2);
+        }
+        return bestS;
+    }
+
+    /** Точка на линии улицы на расстоянии s метров от её начала. */
+    private GeoPoint pointAtArcLength(double s) {
+        double acc = 0;
+        double refLat = followedChain.get(0).getLatitude();
+        double cosLat = Math.cos(Math.toRadians(refLat));
+        for (int i = 0; i + 1 < followedChain.size(); i++) {
+            GeoPoint a = followedChain.get(i);
+            GeoPoint b = followedChain.get(i + 1);
+            double len = distanceMeters(a, b);
+            if (len <= 0) {
+                continue;
+            }
+            if (acc + len >= s) {
+                double t = (s - acc) / len;
+                return new GeoPoint(
+                        a.getLatitude() + (b.getLatitude() - a.getLatitude()) * t,
+                        a.getLongitude() + (b.getLongitude() - a.getLongitude()) * t);
+            }
+            acc += len;
+        }
+        return null;
+    }
+
     private double screenStepLat() {
         double zoom = getZoomLevelDouble();
         // Примерная высота сдвига в градусах при свайпе вниз/вверх.
@@ -786,7 +1742,51 @@ public class AccessibleMapView extends MapView {
         int cx = screenLocation[0] + tmpPoint.x;
         int cy = screenLocation[1] + tmpPoint.y;
         int r = (int) radius;
+        // Узел улицы должен быть «широким» по всей проезжей части, иначе
+        // скринридер при обводке длинной улицы не попадает в узел и фокус
+        // остаётся на кнопке зума/местоположения. Расширяем прямоугольник
+        // по диагонали улицы, если она загружена.
+        if ("street".equals(f.type)) {
+            String nm = (f.spokenName == null || f.spokenName.isEmpty()) ? f.name : f.spokenName;
+            for (OsmApiClient.RoadInfo r0 : roads) {
+                if (r0.name == null) {
+                    continue;
+                }
+                if (r0.name.equals(nm) || (nm != null && r0.name.equalsIgnoreCase(nm))) {
+                    Rect wide = geoBoundsToScreen(r0, cx, cy, r);
+                    if (wide != null) {
+                        return wide;
+                    }
+                    break;
+                }
+            }
+        }
         return new Rect(cx - r, cy - r, cx + r, cy + r);
+    }
+
+    /**
+     * Экранный прямоугольник, охватывающий геометрию дороги с запасом ±r.
+     * Если точка узла улицы далеко от центра сегмента, прямоугольник всё
+     * равно покрывает всю улицу на экране — TalkMan «видит» её целиком.
+     */
+    private Rect geoBoundsToScreen(OsmApiClient.RoadInfo road, int cx, int cy, float r) {
+        if (road.geometry.isEmpty()) {
+            return null;
+        }
+        int minX = cx - (int) r;
+        int minY = cy - (int) r;
+        int maxX = cx + (int) r;
+        int maxY = cy + (int) r;
+        for (GeoPoint p : road.geometry) {
+            getProjection().toPixels(p, tmpPoint);
+            int px = screenLocation[0] + tmpPoint.x;
+            int py = screenLocation[1] + tmpPoint.y;
+            minX = Math.min(minX, px);
+            minY = Math.min(minY, py);
+            maxX = Math.max(maxX, px);
+            maxY = Math.max(maxY, py);
+        }
+        return new Rect(minX - (int) r, minY - (int) r, maxX + (int) r, maxY + (int) r);
     }
 
     public List<MapFeature> getFeatures() {
