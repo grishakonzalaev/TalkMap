@@ -11,6 +11,14 @@
     <string name="status_network_error">Не удалось загрузить объекты. Проверьте подключение к интернету.</string>
     <string name="status_no_objects">Подписанных объектов рядом нет.</string>
     <string name="btn_my_location">Кнопка: вернуться к моему местоположению</string>
+    <string name="btn_search">Кнопка: поиск</string>
+    <string name="btn_search_close">Кнопка: закрыть поиск</string>
+    <string name="search_hint">Поиск: город, адрес, объект или координаты</string>
+    <string name="search_go">Искать</string>
+    <string name="search_loading">Ищу…</string>
+    <string name="search_no_results">Ничего не найдено. Попробуйте иначе.</string>
+    <string name="search_error">Не удалось выполнить поиск. Проверьте подключение к интернету.</string>
+    <string name="search_prompt">Поиск. Введите город, адрес, объект или координаты «широта, долгота».</string>
     <string name="btn_zoom_in">Кнопка: увеличить масштаб</string>
     <string name="btn_zoom_out">Кнопка: уменьшить масштаб</string>
     <string name="btn_zoom_reset">Кнопка: исходный масштаб</string>

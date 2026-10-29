@@ -24,16 +24,82 @@
         android:textColor="#FFFFFF"
         android:textSize="14sp" />
 
-    <ImageButton
-        android:id="@+id/btn_my_location"
-        android:layout_width="56dp"
-        android:layout_height="56dp"
+    <!-- Панель поиска: появляется по нажатию кнопки поиска. -->
+    <LinearLayout
+        android:id="@+id/search_bar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:layout_marginTop="56dp"
+        android:background="#B3000000"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="8dp"
+        android:visibility="gone">
+
+        <EditText
+            android:id="@+id/search_input"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:background="@android:color/white"
+            android:hint="@string/search_hint"
+            android:importantForAccessibility="yes"
+            android:inputType="text"
+            android:minHeight="48dp"
+            android:padding="8dp"
+            android:singleLine="true"
+            android:textColor="#000000"
+            android:contentDescription="@string/search_prompt" />
+
+        <Button
+            android:id="@+id/search_go"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="@string/search_go"
+            android:contentDescription="@string/search_go" />
+    </LinearLayout>
+
+    <!-- Список результатов поиска. -->
+    <ListView
+        android:id="@+id/search_results"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:layout_marginTop="112dp"
+        android:background="#E6000000"
+        android:visibility="gone" />
+
+    <!-- Правая колонка кнопок: поиск над местоположением, вертикально. -->
+    <LinearLayout
+        android:id="@+id/right_buttons"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
         android:layout_gravity="bottom|end"
         android:layout_margin="16dp"
-        android:background="#CC1565C0"
-        android:contentDescription="@string/btn_my_location"
-        android:padding="12dp"
-        android:src="@drawable/ic_my_location" />
+        android:orientation="vertical"
+        android:importantForAccessibility="yes">
+
+        <ImageButton
+            android:id="@+id/btn_search"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:background="#CC1565C0"
+            android:contentDescription="@string/btn_search"
+            android:padding="14dp"
+            android:src="@drawable/ic_search" />
+
+        <ImageButton
+            android:id="@+id/btn_my_location"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginTop="12dp"
+            android:background="#CC1565C0"
+            android:contentDescription="@string/btn_my_location"
+            android:padding="12dp"
+            android:src="@drawable/ic_my_location" />
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/zoom_controls"

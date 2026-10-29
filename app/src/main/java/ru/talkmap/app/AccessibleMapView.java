@@ -64,6 +64,7 @@ public class AccessibleMapView extends MapView {
 
     private Listener listener;
     private Marker locationMarker;
+    private Marker searchMarker;
     private GeoPoint userLocation;
     /** Виртуальный узел «Вы здесь» в точке местоположения (последний в features). */
     private MapFeature hereFeature;
@@ -222,6 +223,41 @@ public class AccessibleMapView extends MapView {
         refreshHereFeature();
         Log.d(TAG, "setUserLocation -> " + point.getLatitude() + "," + point.getLongitude());
         scheduleReload();
+    }
+
+    /**
+     * Перемещает карту к найденному результату поиска (город, улица, адрес,
+     * объект или координаты). Ставит маркер и озвучивает название, чтобы
+     * пользователь понял, куда приехала карта.
+     */
+    public void centerOnSearchResult(NominatimClient.SearchResult r) {
+        if (r == null) {
+            return;
+        }
+        GeoPoint point = new GeoPoint(r.lat, r.lon);
+        if (searchMarker == null) {
+            searchMarker = new Marker(this);
+            searchMarker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER);
+            searchMarker.setTitle(r.spokenName());
+            searchMarker.setInfoWindow(null);
+            try {
+                searchMarker.setIcon(getResources().getDrawable(R.drawable.dot_location));
+            } catch (Exception e) {
+                Log.w(TAG, "no search icon", e);
+            }
+            getOverlays().add(searchMarker);
+        }
+        searchMarker.setPosition(point);
+        // Найденное место открываем на масштабе города (около 15), чтобы
+        // вокруг была видна зона, куда приехали.
+        getController().setZoom(15.0);
+        getController().animateTo(point);
+        invalidate();
+        // Сообщаем TalkMan, куда приехала карта.
+        announceForAccessibility("Найдено: " + r.spokenName() + ". "
+                + "Карта перемещена к этому месту.");
+        Log.d(TAG, "centerOnSearchResult -> " + r.lat + "," + r.lon
+                + " name=" + r.spokenName());
     }
 
     /** Кнопка «моё местоположение»: запрашивает свежий фикс и двигает карту. */

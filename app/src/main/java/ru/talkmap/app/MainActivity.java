@@ -2,13 +2,22 @@ package ru.talkmap.app;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.BaseAdapter;
+import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ImageButton;
+import android.widget.ListView;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
@@ -18,6 +27,7 @@ import androidx.core.content.ContextCompat;
 
 import org.osmdroid.util.GeoPoint;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -36,6 +46,13 @@ public class MainActivity extends AppCompatActivity
     private ImageButton btnZoomIn;
     private ImageButton btnZoomOut;
     private ImageButton btnZoomReset;
+    private ImageButton btnSearch;
+    private View searchBar;
+    private EditText searchInput;
+    private Button searchGo;
+    private ListView searchResults;
+    private SearchAdapter searchAdapter;
+    private NominatimClient nominatim;
     private LocationManager locationManager;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private LocationListener locationListener;
@@ -52,7 +69,17 @@ public class MainActivity extends AppCompatActivity
         btnZoomIn = findViewById(R.id.btn_zoom_in);
         btnZoomOut = findViewById(R.id.btn_zoom_out);
         btnZoomReset = findViewById(R.id.btn_zoom_reset);
+        btnSearch = findViewById(R.id.btn_search);
+        searchBar = findViewById(R.id.search_bar);
+        searchInput = findViewById(R.id.search_input);
+        searchGo = findViewById(R.id.search_go);
+        searchResults = findViewById(R.id.search_results);
         map.setListener(this);
+
+        nominatim = new NominatimClient(this);
+        searchAdapter = new SearchAdapter();
+        searchResults.setAdapter(searchAdapter);
+        setupSearch();
 
         btnMyLocation.setOnClickListener(v -> {
             // Если только что озвучена улица (обводка), а TalkMan держит фокус
@@ -89,6 +116,186 @@ public class MainActivity extends AppCompatActivity
         map.getController().setCenter(DEFAULT_CENTER);
 
         requestLocationOrFallback();
+    }
+
+    private void toggleSearchBar() {
+        if (searchBar.getVisibility() == View.VISIBLE) {
+            hideSearch();
+            return;
+        }
+        showSearchBar();
+    }
+
+    private void showSearchBar() {
+        searchBar.setVisibility(View.VISIBLE);
+        searchResults.setVisibility(View.GONE);
+        searchInput.requestFocus();
+        openKeyboard();
+        map.announceForAccessibility(getString(R.string.search_prompt));
+    }
+
+    private void hideSearch() {
+        searchInput.clearFocus();
+        searchInput.setText("");
+        closeKeyboard();
+        searchBar.setVisibility(View.GONE);
+        searchResults.setVisibility(View.GONE);
+        searchResults.setAdapter(searchAdapter);
+        searchAdapter.clear();
+        searchGo.setEnabled(true);
+        searchGo.setText(R.string.search_go);
+    }
+
+    private void setupSearch() {
+        btnSearch.setOnClickListener(v -> toggleSearchBar());
+        // Тестовая иконка не нужна: активируем по кнопке.
+        searchGo.setOnClickListener(v -> performSearch());
+        searchInput.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEARCH
+                    || (event != null && event.getKeyCode() == android.view.KeyEvent.KEYCODE_ENTER)) {
+                performSearch();
+                return true;
+            }
+            return false;
+        });
+        searchResults.setOnItemClickListener((parent, view, position, id) -> {
+            NominatimClient.SearchResult r = searchAdapter.get(position);
+            if (r == null) {
+                return;
+            }
+            hideSearch();
+            map.centerOnSearchResult(r);
+        });
+    }
+
+    private void performSearch() {
+        String query = searchInput.getText().toString().trim();
+        if (query.isEmpty()) {
+            renderNoResults(R.string.search_no_results);
+            return;
+        }
+        searchGo.setEnabled(false);
+        searchGo.setText(R.string.search_loading);
+        searchResults.setVisibility(View.GONE);
+        nominatim.search(query, new NominatimClient.Callback() {
+            @Override
+            public void onResult(List<NominatimClient.SearchResult> results) {
+                searchGo.setEnabled(true);
+                searchGo.setText(R.string.search_go);
+                if (results == null || results.isEmpty()) {
+                    renderNoResults(R.string.search_no_results);
+                    return;
+                }
+                searchResults.setAdapter(searchAdapter);
+                searchAdapter.set(results);
+                searchResults.setVisibility(View.VISIBLE);
+                searchResults.announceForAccessibility(
+                        "Найдено: " + results.size() + ". Первый: " + results.get(0).spokenName());
+            }
+
+            @Override
+            public void onError(Exception e) {
+                searchGo.setEnabled(true);
+                searchGo.setText(R.string.search_go);
+                renderNoResults(R.string.search_error);
+            }
+        });
+    }
+
+    private void renderNoResults(int resId) {
+        searchAdapter.clear();
+        String msg = getString(resId);
+        searchResults.setVisibility(View.VISIBLE);
+        searchResults.setAdapter(new BaseAdapter() {
+            @Override
+            public int getCount() {
+                return 1;
+            }
+
+            @Override
+            public Object getItem(int position) {
+                return msg;
+            }
+
+            @Override
+            public long getItemId(int position) {
+                return position;
+            }
+
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                TextView tv = convertView instanceof TextView ? (TextView) convertView : new TextView(MainActivity.this);
+                tv.setText(msg);
+                tv.setTextColor(Color.WHITE);
+                tv.setPadding(24, 16, 24, 16);
+                tv.setTextSize(16);
+                return tv;
+            }
+        });
+        searchResults.announceForAccessibility(msg);
+    }
+
+    private void openKeyboard() {
+        searchInput.post(() -> {
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) {
+                imm.showSoftInput(searchInput, InputMethodManager.SHOW_IMPLICIT);
+            }
+        });
+    }
+
+    private void closeKeyboard() {
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.hideSoftInputFromWindow(searchInput.getWindowToken(), 0);
+        }
+    }
+
+    private class SearchAdapter extends BaseAdapter {
+        private final List<NominatimClient.SearchResult> items = new ArrayList<>();
+
+        void set(List<NominatimClient.SearchResult> list) {
+            items.clear();
+            items.addAll(list);
+            notifyDataSetChanged();
+        }
+
+        void clear() {
+            items.clear();
+            notifyDataSetChanged();
+        }
+
+        NominatimClient.SearchResult get(int position) {
+            return position >= 0 && position < items.size() ? items.get(position) : null;
+        }
+
+        @Override
+        public int getCount() {
+            return items.size();
+        }
+
+        @Override
+        public Object getItem(int position) {
+            return items.get(position);
+        }
+
+        @Override
+        public long getItemId(int position) {
+            return position;
+        }
+
+        @Override
+        public View getView(int position, View convertView, ViewGroup parent) {
+            TextView tv = convertView instanceof TextView ? (TextView) convertView : new TextView(MainActivity.this);
+            NominatimClient.SearchResult r = items.get(position);
+            tv.setText(r.spokenName());
+            tv.setTextColor(Color.WHITE);
+            tv.setTextSize(16);
+            tv.setPadding(24, 18, 24, 18);
+            tv.setContentDescription(r.displayName);
+            tv.setClickable(false);
+            return tv;
+        }
     }
 
     private void requestLocationOrFallback() {
