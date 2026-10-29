@@ -65,6 +65,10 @@ public class AccessibleMapView extends MapView {
     private Listener listener;
     private Marker locationMarker;
     private GeoPoint userLocation;
+    /** Виртуальный узел «Вы здесь» в точке местоположения (последний в features). */
+    private MapFeature hereFeature;
+    /** Фраза ближайшего объекта, если он совпадает с точкой «Вы здесь». */
+    private String hereOverlapPhrase;
     /** Стартовый масштаб: 16 — видно улицы вокруг, а не один дом. */
     private static final double DEFAULT_ZOOM = 16.0;
     /** Предел радиуса загрузки: больше не влезает в лимиты OSM API по времени. */
@@ -213,6 +217,9 @@ public class AccessibleMapView extends MapView {
         }
         getController().animateTo(point);
         invalidate();
+        // Держим виртуальный узел «Вы здесь» в актуальной точке сразу,
+        // не дожидаясь перезагрузки объектов (scheduleReload асинхронный).
+        refreshHereFeature();
         Log.d(TAG, "setUserLocation -> " + point.getLatitude() + "," + point.getLongitude());
         scheduleReload();
     }
@@ -393,7 +400,9 @@ public class AccessibleMapView extends MapView {
                     setFeatures(newFeatures, newRoads);
                 }
                 if (listener != null) {
-                    listener.onCount(features.size());
+                    // «Вы здесь» — не объект карты, не считаем его.
+                    int shown = features.size() - (hereFeature != null ? 1 : 0);
+                    listener.onCount(shown);
                 }
             }
 
@@ -440,11 +449,58 @@ public class AccessibleMapView extends MapView {
     private int countRealFeatures(List<MapFeature> list) {
         int n = 0;
         for (MapFeature f : list) {
-            if (!"junction".equals(f.type)) {
+            if (!"junction".equals(f.type) && !"here".equals(f.type)) {
                 n++;
             }
         }
         return n;
+    }
+
+    /**
+     * Держит виртуальный узел «Вы здесь» в точке местоположения.
+     * Узел всегда последний в features, чтобы не сдвигать индексы объектов.
+     */
+    private void refreshHereFeature() {
+        if (hereFeature != null) {
+            int idx = features.indexOf(hereFeature);
+            if (idx >= 0) {
+                features.remove(idx);
+            }
+        }
+        if (userLocation == null) {
+            hereFeature = null;
+            hereOverlapPhrase = null;
+            return;
+        }
+        hereOverlapPhrase = computeHereOverlap();
+        hereFeature = new MapFeature(userLocation.getLatitude(), userLocation.getLongitude(),
+                "Вы здесь", "here", "Вы здесь", "", null);
+        features.add(hereFeature);
+    }
+
+    /**
+     * Фраза ближайшего объекта в точке «Вы здесь», если он совпадает с ней.
+     * Возвращается «Название, тип» без «Вы здесь» — хвост добавляет phraseFor.
+     */
+    private String computeHereOverlap() {
+        if (userLocation == null) {
+            return null;
+        }
+        getProjection().toPixels(
+                new GeoPoint(userLocation.getLatitude(), userLocation.getLongitude()), tmpPoint);
+        float x = tmpPoint.x;
+        float y = tmpPoint.y;
+        MapFeature obj = nearestJunction(x, y);
+        if (obj == null) {
+            obj = nearestNamedFeature(x, y);
+        }
+        if (obj == null) {
+            obj = nearestAddressOrSignal(x, y);
+        }
+        if (obj == null) {
+            return null;
+        }
+        return phraseFor(obj);
     }
 
     private void setFeatures(List<MapFeature> newFeatures, List<OsmApiClient.RoadInfo> newRoads) {
@@ -452,6 +508,8 @@ public class AccessibleMapView extends MapView {
         features.addAll(newFeatures);
         roads.clear();
         roads.addAll(newRoads);
+        // Узел «Вы здесь» в точке местоположения пользователя.
+        refreshHereFeature();
         // Если пользователь следует по улице — обновляем её геометрию,
         // иначе при перезагрузке цепочка может остаться от старой загрузки.
         refreshFollowedSegments();
@@ -466,6 +524,19 @@ public class AccessibleMapView extends MapView {
     // на проезжей части которой находится палец.
     // ------------------------------------------------------------------
     private MapFeature featureNear(float x, float y) {
+        // Точка «Вы здесь»: если палец на ней, озвучиваем (при совпадении с
+        // объектом — «объект, вы здесь»). Проверяем первой, чтобы составная
+        // фраза не перебивалась отдельным объектом на том же месте.
+        if (hereFeature != null) {
+            getProjection().toPixels(
+                    new GeoPoint(hereFeature.lat, hereFeature.lon), tmpPoint);
+            float hx = tmpPoint.x - x;
+            float hy = tmpPoint.y - y;
+            float hr = hitRadiusPx();
+            if (hx * hx + hy * hy <= hr * hr) {
+                return hereFeature;
+            }
+        }
         // Сначала перекрёсток: на многих перекрёстках вплотную стоят киоски,
         // остановки и магазины, которые «перебивали» перекрёсток. В его центре
         // пользователь должен слышать перекрёсток, а объекты — чуть в стороне.
@@ -655,6 +726,13 @@ public class AccessibleMapView extends MapView {
     }
 
     private String phraseFor(MapFeature f) {
+        // «Вы здесь» в точке местоположения: если там же стоит объект,
+        // сначала называется название и тип объекта, затем «вы здесь».
+        if ("here".equals(f.type)) {
+            return (hereOverlapPhrase == null || hereOverlapPhrase.isEmpty())
+                    ? "Вы здесь"
+                    : hereOverlapPhrase + ", вы здесь";
+        }
         // Именованные улицы озвучиваем просто названием: направление
         // добавляется отдельно, когда палец на проезжей части.
         if ("street".equals(f.type)) {
