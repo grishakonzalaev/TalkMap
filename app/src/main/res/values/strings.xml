@@ -22,4 +22,10 @@
     <string name="btn_zoom_in">Кнопка: увеличить масштаб</string>
     <string name="btn_zoom_out">Кнопка: уменьшить масштаб</string>
     <string name="btn_zoom_reset">Кнопка: исходный масштаб</string>
+    <string name="menu_details">Показать подробности</string>
+    <string name="menu_copy_coords">Копировать координаты</string>
+    <string name="menu_route">Проложить маршрут</string>
+    <string name="menu_coords_copied">Координаты скопированы: %1$s</string>
+    <string name="menu_route_no_app">Не найдено приложение для навигации.</string>
+    <string name="menu_route_chooser">Проложить маршрут</string>
 </resources>

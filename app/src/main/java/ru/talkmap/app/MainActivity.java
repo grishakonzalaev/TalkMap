@@ -1,14 +1,20 @@
 package ru.talkmap.app;
 
 import android.Manifest;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
@@ -19,6 +25,8 @@ import android.widget.EditText;
 import android.widget.ImageButton;
 import android.widget.ListView;
 import android.widget.TextView;
+
+import androidx.appcompat.app.AlertDialog;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -37,6 +45,7 @@ import java.util.List;
 public class MainActivity extends AppCompatActivity
         implements AccessibleMapView.Listener {
 
+    private static final String TAG = "TalkMap";
     private static final int REQUEST_LOCATION = 100;
     private static final GeoPoint DEFAULT_CENTER = new GeoPoint(55.030204, 82.920430); // Новосибирск
 
@@ -88,10 +97,18 @@ public class MainActivity extends AppCompatActivity
             if (map.handleStreetSelectionClick()) {
                 return;
             }
+            // Если только что озвучен объект — долгое нажатие/двойной тап с
+            // удержанием уходит кнопке, а не объекту: открываем меню объекта.
+            if (map.handleMenuSelectionClick()) {
+                return;
+            }
             map.centerOnUser();
         });
         btnZoomIn.setOnClickListener(v -> {
             if (map.handleStreetSelectionClick()) {
+                return;
+            }
+            if (map.handleMenuSelectionClick()) {
                 return;
             }
             map.zoomIn();
@@ -100,10 +117,16 @@ public class MainActivity extends AppCompatActivity
             if (map.handleStreetSelectionClick()) {
                 return;
             }
+            if (map.handleMenuSelectionClick()) {
+                return;
+            }
             map.zoomOut();
         });
         btnZoomReset.setOnClickListener(v -> {
             if (map.handleStreetSelectionClick()) {
+                return;
+            }
+            if (map.handleMenuSelectionClick()) {
                 return;
             }
             map.resetZoom();
@@ -147,7 +170,12 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void setupSearch() {
-        btnSearch.setOnClickListener(v -> toggleSearchBar());
+        btnSearch.setOnClickListener(v -> {
+            if (map.handleMenuSelectionClick()) {
+                return;
+            }
+            toggleSearchBar();
+        });
         // Тестовая иконка не нужна: активируем по кнопке.
         searchGo.setOnClickListener(v -> performSearch());
         searchInput.setOnEditorActionListener((v, actionId, event) -> {
@@ -295,6 +323,96 @@ public class MainActivity extends AppCompatActivity
             tv.setContentDescription(r.displayName);
             tv.setClickable(false);
             return tv;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Контекстное меню объекта: подробности, копировать координаты, маршрут.
+    // ------------------------------------------------------------------
+    @Override
+    public void onRoute(MapFeature f) {
+        if (f == null) {
+            return;
+        }
+        openRoutePicker(f);
+    }
+
+    @Override
+    public void onFeatureMenu(MapFeature f) {
+        if (f == null) {
+            return;
+        }
+        String[] items = {
+                getString(R.string.menu_details),
+                getString(R.string.menu_copy_coords),
+                getString(R.string.menu_route)
+        };
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(titleFor(f))
+                .setItems(items, (d, which) -> {
+                    switch (which) {
+                        case 0:
+                            showDetails(f);
+                            break;
+                        case 1:
+                            copyCoordinates(f);
+                            break;
+                        case 2:
+                            openRoutePicker(f);
+                            break;
+                    }
+                })
+                .create();
+        dialog.setOnShowListener(d -> dialog.getWindow()
+                .setDimAmount(0.3f));
+        dialog.show();
+    }
+
+    private String titleFor(MapFeature f) {
+        String name = (f.spokenName != null && !f.spokenName.isEmpty()) ? f.spokenName : f.name;
+        if (name != null && !name.isEmpty()) {
+            return name;
+        }
+        return CategoryNames.humanize(f.type);
+    }
+
+    private void showDetails(MapFeature f) {
+        String text = FeatureDetails.format(f);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(titleFor(f))
+                .setMessage(text)
+                .setPositiveButton(android.R.string.ok, null)
+                .create();
+        dialog.setOnShowListener(d -> dialog.getWindow().setDimAmount(0.3f));
+        dialog.show();
+        dialog.getWindow().setDimAmount(0.3f);
+    }
+
+    private void copyCoordinates(MapFeature f) {
+        String coords = String.format(java.util.Locale.US, "%.6f, %.6f", f.lat, f.lon);
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null) {
+            cm.setPrimaryClip(ClipData.newPlainText("coordinates", coords));
+        }
+        map.announceForAccessibility(getString(R.string.menu_coords_copied, coords));
+    }
+
+    /** Системный выбор навигатора: geo:lat,lon?q=... */
+    private void openRoutePicker(MapFeature f) {
+        String coords = String.format(java.util.Locale.US, "%.6f,%.6f", f.lat, f.lon);
+        String label = (f.spokenName != null && !f.spokenName.isEmpty()) ? f.spokenName : f.name;
+        Uri geo = Uri.parse("geo:" + coords + "?q=" + coords
+                + (label != null && !label.isEmpty() ? "(" + Uri.encode(label) + ")" : ""));
+        Intent intent = new Intent(Intent.ACTION_VIEW, geo);
+        try {
+            // Системное окно выбора навигатора (если приложений несколько).
+            Intent chooser = Intent.createChooser(intent,
+                    getString(R.string.menu_route_chooser));
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(chooser);
+        } catch (Exception e) {
+            Log.e(TAG, "no navigation app", e);
+            map.announceForAccessibility(getString(R.string.menu_route_no_app));
         }
     }
 

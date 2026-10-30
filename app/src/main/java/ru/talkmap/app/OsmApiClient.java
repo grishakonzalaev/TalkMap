@@ -180,7 +180,7 @@ public class OsmApiClient {
                 "  node[\"highway\"=\"traffic_signals\"](around:" + r + "," + c + ");\n" +
                 "  node[\"highway\"=\"crossing\"](around:" + r + "," + c + ");\n" +
                 ");\n" +
-                "out center tags;";
+                "out center geom tags;";
     }
 
     static String buildRoadsQuery(double lat, double lon, double radius) {
@@ -679,6 +679,7 @@ public class OsmApiClient {
             if (ll == null) {
                 continue;
             }
+            List<GeoPoint> polygon = parsePolygon(el);
             String name = tags.optString("name:ru", tags.optString("name", "")).trim();
             if (!name.isEmpty()) {
                 String typeKey = pickTypeKey(tags);
@@ -690,7 +691,8 @@ public class OsmApiClient {
                     continue;
                 }
                 String spokenType = CategoryNames.humanize(typeKey);
-                named.add(new MapFeature(ll[0], ll[1], name, typeKey, name, spokenType));
+                named.add(new MapFeature(ll[0], ll[1], name, typeKey, name, spokenType, null,
+                        copyTags(tags), polygon));
                 continue;
             }
 
@@ -709,7 +711,8 @@ public class OsmApiClient {
                 if (!seen.add(dedup)) {
                     continue;
                 }
-                addresses.add(new MapFeature(ll[0], ll[1], addr, "addr=housenumber", addr, ""));
+                addresses.add(new MapFeature(ll[0], ll[1], addr, "addr=housenumber", addr, "",
+                        null, copyTags(tags), polygon));
                 continue;
             }
 
@@ -727,7 +730,8 @@ public class OsmApiClient {
                     continue;
                 }
                 String spokenType = CategoryNames.humanize(typeKey);
-                small.add(new MapFeature(ll[0], ll[1], "", typeKey, "", spokenType));
+                small.add(new MapFeature(ll[0], ll[1], "", typeKey, "", spokenType,
+                        null, copyTags(tags)));
             }
         }
         // Приоритет: подписанные объекты, затем адреса домов.
@@ -765,6 +769,32 @@ public class OsmApiClient {
         return new double[]{lat, lon};
     }
 
+    /**
+     * Внешний контур полигона для площадных объектов (здания, крупные магазины).
+     * Для узлов (node) и элементов без геометрии возвращает null.
+     */
+    private List<GeoPoint> parsePolygon(JSONObject el) {
+        if ("node".equals(el.optString("type", ""))) {
+            return null;
+        }
+        JSONArray geom = el.optJSONArray("geometry");
+        if (geom == null || geom.length() < 3) {
+            return null;
+        }
+        List<GeoPoint> out = new ArrayList<>();
+        for (int i = 0; i < geom.length(); i++) {
+            JSONObject g = geom.optJSONObject(i);
+            if (g != null) {
+                double lat = g.optDouble("lat", Double.NaN);
+                double lon = g.optDouble("lon", Double.NaN);
+                if (!Double.isNaN(lat) && !Double.isNaN(lon)) {
+                    out.add(new GeoPoint(lat, lon));
+                }
+            }
+        }
+        return out.size() >= 3 ? out : null;
+    }
+
     private String fmt(double[] ll) {
         return String.format(Locale.US, "%.5f,%.5f", ll[0], ll[1]);
     }
@@ -783,6 +813,22 @@ public class OsmApiClient {
             }
         }
         return null;
+    }
+
+    /** Копия оригинальных тегов OSM для контекстного меню (или null). */
+    private Map<String, String> copyTags(JSONObject tags) {
+        if (tags == null || tags.length() == 0) {
+            return null;
+        }
+        Map<String, String> out = new LinkedHashMap<>();
+        for (java.util.Iterator<String> it = tags.keys(); it.hasNext(); ) {
+            String k = it.next();
+            String v = tags.optString(k, "");
+            if (!v.isEmpty()) {
+                out.put(k, v);
+            }
+        }
+        return out.isEmpty() ? null : out;
     }
 
     private static final Set<String> ROAD_VALUES = new HashSet<>(Arrays.asList(
@@ -912,7 +958,7 @@ public class OsmApiClient {
             String[] names = pairNames.get(e.getKey());
             String spoken = "Перекрёсток: " + names[0] + " и " + names[1];
             out.add(new MapFeature(lat, lon, names[0] + " и " + names[1],
-                    "junction", spoken, ""));
+                    "junction", spoken, "", null, null));
         }
         return out;
     }
@@ -958,6 +1004,22 @@ public class OsmApiClient {
         return new File(appContext.getFilesDir(), "talkmap_cache.json");
     }
 
+    /** Читает внешний контур полигона объекта из кэша (или null). */
+    private List<GeoPoint> readPolygon(JSONObject o) {
+        JSONArray geom = o.optJSONArray("polygon");
+        if (geom == null || geom.length() < 3) {
+            return null;
+        }
+        List<GeoPoint> out = new ArrayList<>();
+        for (int i = 0; i < geom.length(); i++) {
+            JSONObject g = geom.optJSONObject(i);
+            if (g != null) {
+                out.add(new GeoPoint(g.optDouble("lat", 0), g.optDouble("lon", 0)));
+            }
+        }
+        return out.size() >= 3 ? out : null;
+    }
+
     private void saveCache(Result result, double lat, double lon, double radius) {
         try {
             JSONObject root = new JSONObject();
@@ -973,6 +1035,20 @@ public class OsmApiClient {
                 o.put("type", f.type);
                 o.put("spokenName", f.spokenName);
                 o.put("spokenType", f.spokenType);
+                if (f.tags != null) {
+                    o.put("tags", new JSONObject(f.tags));
+                }
+                if (f.hasPolygon()) {
+                    JSONArray poly = new JSONArray();
+                    for (int p = 0; p < f.polygon.size(); p++) {
+                        GeoPoint pt = f.polygon.get(p);
+                        JSONObject g = new JSONObject();
+                        g.put("lat", pt.getLatitude());
+                        g.put("lon", pt.getLongitude());
+                        poly.put(g);
+                    }
+                    o.put("polygon", poly);
+                }
                 arr.put(o);
             }
             root.put("features", arr);
@@ -1015,10 +1091,20 @@ public class OsmApiClient {
                 if (o == null) {
                     continue;
                 }
+                JSONObject tagObj = o.optJSONObject("tags");
+                Map<String, String> tags = null;
+                if (tagObj != null) {
+                    tags = new LinkedHashMap<>();
+                    for (java.util.Iterator<String> it = tagObj.keys(); it.hasNext(); ) {
+                        String k = it.next();
+                        tags.put(k, tagObj.optString(k, ""));
+                    }
+                }
                 result.features.add(new MapFeature(
                         o.optDouble("lat", 0), o.optDouble("lon", 0),
                         o.optString("name", ""), o.optString("type", ""),
-                        o.optString("spokenName", ""), o.optString("spokenType", "")));
+                        o.optString("spokenName", ""), o.optString("spokenType", ""),
+                        null, tags, readPolygon(o)));
             }
             Log.i(TAG, "cache loaded, features=" + result.features.size()
                     + " center=" + result.centerLat + "," + result.centerLon
