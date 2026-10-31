@@ -97,40 +97,33 @@ public class MainActivity extends AppCompatActivity
             if (map.handleStreetSelectionClick()) {
                 return;
             }
-            // Если только что озвучен объект — долгое нажатие/двойной тап с
-            // удержанием уходит кнопке, а не объекту: открываем меню объекта.
-            if (map.handleMenuSelectionClick()) {
-                return;
-            }
             map.centerOnUser();
         });
+        // ДОЛГОЕ нажатие кнопки — открыть контекстное меню объекта, по которому
+        // пользователь вёл палец по карте (а не активировать кнопку). Короткий
+        // клик продолжает выполнять действие кнопки (см. onClick выше).
+        btnMyLocation.setOnLongClickListener(v -> map.handleMenuLongPress());
         btnZoomIn.setOnClickListener(v -> {
             if (map.handleStreetSelectionClick()) {
                 return;
             }
-            if (map.handleMenuSelectionClick()) {
-                return;
-            }
             map.zoomIn();
         });
+        btnZoomIn.setOnLongClickListener(v -> map.handleMenuLongPress());
         btnZoomOut.setOnClickListener(v -> {
             if (map.handleStreetSelectionClick()) {
                 return;
             }
-            if (map.handleMenuSelectionClick()) {
-                return;
-            }
             map.zoomOut();
         });
+        btnZoomOut.setOnLongClickListener(v -> map.handleMenuLongPress());
         btnZoomReset.setOnClickListener(v -> {
             if (map.handleStreetSelectionClick()) {
                 return;
             }
-            if (map.handleMenuSelectionClick()) {
-                return;
-            }
             map.resetZoom();
         });
+        btnZoomReset.setOnLongClickListener(v -> map.handleMenuLongPress());
 
         locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
 
@@ -170,12 +163,9 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void setupSearch() {
-        btnSearch.setOnClickListener(v -> {
-            if (map.handleMenuSelectionClick()) {
-                return;
-            }
-            toggleSearchBar();
-        });
+        btnSearch.setOnClickListener(v -> toggleSearchBar());
+        // Долгое нажатие кнопки поиска — меню объекта под пальцем (не поиск).
+        btnSearch.setOnLongClickListener(v -> map.handleMenuLongPress());
         // Тестовая иконка не нужна: активируем по кнопке.
         searchGo.setOnClickListener(v -> performSearch());
         searchInput.setOnEditorActionListener((v, actionId, event) -> {

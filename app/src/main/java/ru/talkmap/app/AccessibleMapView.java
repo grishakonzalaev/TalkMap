@@ -106,17 +106,8 @@ public class AccessibleMapView extends MapView {
     private long lastStreetPhraseAt = 0;
     /** Имя улицы из последней озвученной фразы (без слов «с севера на юг»). */
     private String lastStreetName = null;
-    /** Последний озвученный точечный объект (не улица, не «вы здесь») —
-     *  для перехвата долгого нажатия как вызова контекстного меню. */
-    private MapFeature lastMenuFeature = null;
-    /** Момент озвучки последнего объекта — окно перехвата долгого нажатия. */
-    private long lastMenuFeatureAt = 0;
-    /** Окно, в котором долгое нажатие кнопки считается вызовом меню объекта. */
-    private static final long MENU_SELECTION_MS = 10000L;
     /** Время первого перехваченного клика улицы — гашение второго клика пары TalkMan. */
     private long lastConsumedStreetClickAt = 0;
-    /** Время первого перехваченного клика меню объекта — гашение второго клика пары. */
-    private long lastConsumedMenuClickAt = 0;
     /** Следование по улице: имя улицы, по которой едет карта. */
     private String followedStreetName = null;
     /** Сегменты (way) следуемой улицы. */
@@ -435,42 +426,32 @@ public class AccessibleMapView extends MapView {
     }
 
     /**
-     * Был ли недавно озвучен точечный объект (для перехвата долгого нажатия).
-     * Аналог isStreetRecentlySpoken(), но для контекстного меню.
+     * Обработка ДОЛГОГО нажатия кнопки (зум/местоположение/поиск/навигация)
+     * как вызова контекстного меню объекта, по которому пользователь вёл палец
+     * по карте. Возвращает true, если долгое нажатие обработано как вызов меню —
+     * кнопку выполнять не нужно.
+     *
+     * Решает баг «после касания кнопки меню не открывается»: TalkBack/Jieshuo
+     * держат фокус ввода на последней активированной кнопке, поэтому долгий тап
+     * по объекту уходит кнопке, а не карте. Здесь мы перехватываем долгое
+     * нажатие кнопки и открываем меню объекта под точкой обводки (lastHoverX/Y).
+     * Обычный (короткий) клик кнопки продолжает выполнять своё действие.
      */
-    public boolean isMenuFeatureRecentlySpoken() {
-        return lastMenuFeature != null && lastMenuFeatureAt > 0
-                && System.currentTimeMillis() - lastMenuFeatureAt <= MENU_SELECTION_MS;
-    }
-
-    /**
-     * Обработка нажатия кнопки (зум/поиск/местоположение/навигация) из
-     * MainActivity как ВЫЗОВА КОНТЕКСТНОГО МЕНЮ последнего озвученного объекта.
-     * Возвращает true, если нажатие уже обработано как вызов меню объекта —
-     * кнопку выполнять не нужно. Это то же решение, что и для улиц
-     * (handleStreetSelectionClick), но для долгого нажатия по точечному объекту:
-     * скринридер после озвучки объекта держит фокус ввода на кнопке, поэтому
-     * долгое нажатие/двойной тап с удержанием уходит кнопке, а не объекту.
-     */
-    public boolean handleMenuSelectionClick() {
-        long now = System.currentTimeMillis();
-        // Гасим второй клик пары TalkMan (двойное нажатие = два ACTION_CLICK).
-        if (lastConsumedMenuClickAt > 0
-                && now - lastConsumedMenuClickAt <= DOUBLE_CLICK_MS) {
-            lastConsumedMenuClickAt = now;
-            Log.d(TAG, "button menu pair click consumed");
-            return true;
-        }
-        if (!isMenuFeatureRecentlySpoken()) {
+    public boolean handleMenuLongPress() {
+        if (lastHoverX < 0 || lastHoverY < 0) {
             return false;
         }
-        MapFeature f = lastMenuFeature;
-        lastConsumedMenuClickAt = now;
-        if (f != null && listener != null) {
-            Log.d(TAG, "menu selection click -> onFeatureMenu " + f.name);
+        MapFeature f = actionTargetFeature();
+        if (f == null) {
+            return false;
+        }
+        if ("street".equals(f.type) || "here".equals(f.type)) {
+            return false;
+        }
+        if (listener != null) {
+            Log.d(TAG, "handleMenuLongPress -> onFeatureMenu " + f.name);
             listener.onFeatureMenu(f);
         }
-        // Кнопку не выполняем: пользователь целился в объект, а не в зум.
         return true;
     }
 
@@ -991,18 +972,7 @@ public class AccessibleMapView extends MapView {
                         lastVirtualNode = node;
                         lastStreetPhrase = null;
                         sendHoverEnter(node, phraseFor(f));
-                        // Запоминаем последний озвученный точечный объект — для
-                        // перехвата долгого нажатия (как street-перехват клика).
-                        // Если после озвучки объекта скринридер держит фокус на
-                        // кнопке (зум/поиск/навигация) и долгое нажатие уходит
-                        // кнопке, мы откроем меню ЭТОГО объекта, а не нажмём кнопку.
-                        if (!"street".equals(f.type) && !"here".equals(f.type)
-                                && !"junction".equals(f.type)) {
-                            lastMenuFeature = f;
-                            lastMenuFeatureAt = System.currentTimeMillis();
-                        }
-                        // Фокус/озвучку уже обработали в sendHoverEnter (по типу
-                        // читалки). Здесь только вибро-отклик на смену объекта.
+                        // Здесь только вибро-отклик на смену объекта.
                         performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                     }
                     return true;
@@ -1222,6 +1192,11 @@ public class AccessibleMapView extends MapView {
         // сразу, прерывая предыдущий.
         interruptSpeech();
         announceForAccessibility(phrase);
+        // НЕ переносим фокус на узел автоматически: это ломает доставку
+        // ACTION_LONG_CLICK/ACTION_CLICK от TalkBack — меню перестаёт открываться,
+        // а фокус «разгуливается». TalkBack сам управляет фокусом по bounds.
+        // Правильный выбор объекта для меню/маршрута делаем в performAction
+        // по точке обводки (lastHoverX/Y) — она точнее, чем virtualViewId.
         Log.d(TAG, "sendHoverEnter node=" + nodeId + " phrase=" + phrase
                 + " modified=" + isModifiedTalkback());
         lastSpoken = phrase;
@@ -1367,7 +1342,13 @@ public class AccessibleMapView extends MapView {
             long now = SystemClock.uptimeMillis();
             // Долгое нажатие по точечному объекту — контекстное меню.
             if (action == AccessibilityNodeInfo.ACTION_LONG_CLICK) {
-                MapFeature f = featureById(virtualViewId);
+                // Объект определяем по точке обводки (lastHoverX/Y), а не по
+                // virtualViewId: TalkBack может прислать id соседнего узла (их
+                // bounds перекрываются), из-за чего меню открывалось «не того
+                // объекта». featureNear(lastHoverX,lastHoverY) — точный хит-тест,
+                // как при озвучке, поэтому меню открывается для того объекта,
+                // на который смотрел пользователь.
+                MapFeature f = actionTargetFeature();
                 if (f != null && !"street".equals(f.type) && !"here".equals(f.type)) {
                     if (listener != null) {
                         listener.onFeatureMenu(f);
@@ -1664,8 +1645,17 @@ public class AccessibleMapView extends MapView {
         if (f == null) {
             return false;
         }
-        if ("street".equals(f.type) || "here".equals(f.type)) {
-            // Для улиц/«Вы здесь» меню не нужно — озвучим, что это не объект.
+        // «Вы здесь» — синтетическая метка, меню для неё не нужно. Но если
+        // пользователь стоит ВНУТРИ реального объекта (здание/магазин), меню
+        // открываем для него — иначе на «Вы здесь» долгий тап молчит.
+        if ("here".equals(f.type)) {
+            f = featureUnderHere();
+            if (f == null) {
+                return false;
+            }
+        }
+        if ("street".equals(f.type)) {
+            // Для улиц меню не нужно — озвучим, что это не объект.
             return false;
         }
         if (listener != null) {
@@ -2109,6 +2099,55 @@ public class AccessibleMapView extends MapView {
 
     private MapFeature featureById(int id) {
         return (id >= 0 && id < features.size()) ? features.get(id) : null;
+    }
+
+    /**
+     * Объект-цель для ACTION_LONG_CLICK/ACTION_CLICK: приоритет — реальная
+     * точка обводки (lastHoverX/Y) через точный хит-тест featureNear, затем
+     * fallback на virtualViewId. Так меню/маршрут открываются для того объекта,
+     * на который указывает пользователь, а не для соседнего узла с
+     * перекрывающимся bounds (который мог прислать TalkBack).
+     */
+    private MapFeature actionTargetFeature() {
+        if (lastHoverX >= 0 && lastHoverY >= 0) {
+            MapFeature near = featureNear(lastHoverX, lastHoverY);
+            if (near != null) {
+                // «Вы здесь» — синтетическая метка, а не объект: меню для неё
+                // бессмысленно. Если палец на «Вы здесь», меню открываем для
+                // того реального объекта, в котором стоит пользователь
+                // (здание/магазин), как при обычном долгом нажатии.
+                if ("here".equals(near.type)) {
+                    return featureUnderHere();
+                }
+                return near;
+            }
+        }
+        return null;
+    }
+
+    /** Реальный объект (не «Вы здесь»), совпадающий с точкой местоположения. */
+    private MapFeature featureUnderHere() {
+        if (userLocation == null) {
+            return null;
+        }
+        getProjection().toPixels(
+                new GeoPoint(userLocation.getLatitude(), userLocation.getLongitude()), tmpPoint);
+        float x = tmpPoint.x;
+        float y = tmpPoint.y;
+        IGeoPoint hereGeo = getProjection().fromPixels((int) x, (int) y);
+        double tLat = hereGeo.getLatitude();
+        double tLon = hereGeo.getLongitude();
+        MapFeature obj = nearestJunction(x, y);
+        if (obj == null) {
+            obj = nearestNamedFeature(x, y, tLat, tLon);
+        }
+        if (obj == null) {
+            obj = nearestAddressOrSignal(x, y, tLat, tLon);
+        }
+        if (obj != null && !"here".equals(obj.type)) {
+            return obj;
+        }
+        return null;
     }
 
     private boolean isOnScreen(MapFeature f) {
