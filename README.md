@@ -30,17 +30,13 @@ Android-приложение, которое позволяет незрячем
 
 ## Установка (APK)
 
-Готовый отладочный APK лежит здесь:
-
-```
-app/build/outputs/apk/debug/app-debug.apk
-```
-
-Установите его на телефон удобным способом (кабель + `adb install`, либо
-копирование файла и «Установить из неизвестных источников»):
+Собранный подписанный APK лежит в [стороне релизов
+GitHub](https://github.com/grishakonzalaev/TalkMap/releases). Скачайте
+`app-release.apk`, скопируйте на телефон и установите (включив
+«Установить из неизвестных источников»), либо через `adb`:
 
 ```powershell
-adb install -r app\build\outputs\apk\debug\app-debug.apk
+adb install -r app-release.apk
 ```
 
 ## Сборка из исходников
