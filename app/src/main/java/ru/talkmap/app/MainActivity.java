@@ -17,6 +17,7 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.BaseAdapter;
@@ -367,10 +368,16 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void showDetails(MapFeature f) {
-        String text = FeatureDetails.format(f);
+        // Каждая деталь — отдельный узел списка: скринридер читает их по
+        // очереди (название, тип, часы работы, телефон, координаты и т.д.),
+        // и пользователь может ознакомиться с информацией последовательно.
+        java.util.List<String> parts = FeatureDetails.parts(f);
+        ListView list = new ListView(this);
+        list.setAdapter(new android.widget.ArrayAdapter<>(
+                this, android.R.layout.simple_list_item_1, parts));
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(titleFor(f))
-                .setMessage(text)
+                .setView(list)
                 .setPositiveButton(android.R.string.ok, null)
                 .create();
         dialog.setOnShowListener(d -> dialog.getWindow().setDimAmount(0.3f));
@@ -385,6 +392,22 @@ public class MainActivity extends AppCompatActivity
             cm.setPrimaryClip(ClipData.newPlainText("coordinates", coords));
         }
         map.announceForAccessibility(getString(R.string.menu_coords_copied, coords));
+    }
+
+    /** Действие скринридера «Показать подробности» — сразу открыть детали. */
+    @Override
+    public void onFeatureDetails(MapFeature f) {
+        if (f != null) {
+            showDetails(f);
+        }
+    }
+
+    /** Действие скринридера «Копировать координаты» — сразу скопировать. */
+    @Override
+    public void onFeatureCopyCoords(MapFeature f) {
+        if (f != null) {
+            copyCoordinates(f);
+        }
     }
 
     /** Системный выбор навигатора: geo:lat,lon?q=... */
@@ -557,6 +580,12 @@ public class MainActivity extends AppCompatActivity
     @Override
     public void onCount(int count) {
         status.setText(getString(R.string.status_objects_count, count));
+    }
+
+    /** Загруженные объекты обновились: обновить слой реальных вью на карте. */
+    @Override
+    public void onFeaturesUpdated() {
+        map.rebuildObjectViews();
     }
 
     @Override

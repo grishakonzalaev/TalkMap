@@ -16,59 +16,82 @@ public final class FeatureDetails {
     private FeatureDetails() {
     }
 
-    public static String format(MapFeature f) {
+    /**
+     * Подробности объекта как СПИСОК строк — каждая деталь отдельным элементом.
+     * Так скринридер (TalkBack/TalkMan) может прочитать их по очереди
+     * (часы работы, телефон, координаты и т.д. — каждый узел отдельно),
+     * а пользователь ознакамливается с информацией последовательно.
+     */
+    public static java.util.List<String> parts(MapFeature f) {
+        java.util.ArrayList<String> out = new java.util.ArrayList<>();
         if (f == null) {
-            return "";
+            return out;
         }
-        StringBuilder sb = new StringBuilder();
         String name = (f.spokenName != null && !f.spokenName.isEmpty()) ? f.spokenName : f.name;
         if (name != null && !name.isEmpty()) {
-            sb.append(name).append("\n");
+            out.add(name);
         }
         String type = CategoryNames.humanize(f.type);
         if (type != null && !type.isEmpty()) {
-            sb.append(type).append("\n");
+            out.add(type);
         }
         Map<String, String> tags = f.tags;
         if (tags == null || tags.isEmpty()) {
             if (f.type != null && !"junction".equals(f.type)) {
-                appendCoords(sb, f);
+                out.add(coords(f));
             }
-            return sb.toString().trim();
+            return out;
         }
 
         String hours = firstOf(tags, "opening_hours", "opening_hours:url");
         if (hours != null) {
-            sb.append("Часы работы: ").append(humanizeHours(hours)).append("\n");
+            out.add("Часы работы: " + humanizeHours(hours));
         }
         String phone = firstOf(tags, "phone", "contact:phone", "tel");
         if (phone != null) {
-            sb.append("Телефон: ").append(phone).append("\n");
+            out.add("Телефон: " + phone);
         }
         String site = firstOf(tags, "website", "contact:website", "url");
         if (site != null) {
-            sb.append("Сайт: ").append(site).append("\n");
+            out.add("Сайт: " + site);
         }
         String email = firstOf(tags, "email", "contact:email");
         if (email != null) {
-            sb.append("Почта: ").append(email).append("\n");
+            out.add("Почта: " + email);
         }
         String operator = firstOf(tags, "operator", "brand");
         if (operator != null) {
-            sb.append("Оператор: ").append(operator).append("\n");
+            out.add("Оператор: " + operator);
         }
         String address = buildAddress(tags);
         if (address != null) {
-            sb.append("Адрес: ").append(address).append("\n");
+            out.add("Адрес: " + address);
         }
-        appendHumanTags(sb, tags, f.type);
-        appendCoords(sb, f);
-        return sb.toString().trim();
+        appendHumanTags(out, tags, f.type);
+        out.add(coords(f));
+        return out;
     }
 
-    private static void appendCoords(StringBuilder sb, MapFeature f) {
-        sb.append(String.format(java.util.Locale.US, "Координаты: %.6f, %.6f", f.lat, f.lon))
-                .append("\n");
+    /** Одна строка «Координаты: lat, lon» — отдельный узел для скринридера. */
+    private static String coords(MapFeature f) {
+        return String.format(java.util.Locale.US, "Координаты: %.6f, %.6f", f.lat, f.lon);
+    }
+
+    /**
+     * То же содержимое, что {@link #parts}, но одной строкой (для старого
+     * диалога-сообщения). Фактически детали по-прежнему разбиваются на строки
+     * через «\n», но читаются как единый текст.
+     */
+    public static String format(MapFeature f) {
+        java.util.List<String> parts = parts(f);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.size(); i++) {
+            if (i > 0) {
+                sb.append("\n");
+            }
+            sb.append(parts.get(i));
+        }
+        return sb.toString();
     }
 
     private static String firstOf(Map<String, String> tags, String... keys) {
@@ -110,7 +133,8 @@ public final class FeatureDetails {
      * Остальные теги объекта — в человекочитаемом виде. Ключи, уже показанные
      * выше (имя, часы, контакты, адрес, тип), пропускаем, чтобы не дублировать.
      */
-    private static void appendHumanTags(StringBuilder sb, Map<String, String> tags, String typeKey) {
+    private static void appendHumanTags(java.util.List<String> out,
+                                        Map<String, String> tags, String typeKey) {
         String typeBase = typeKey;
         int eq = typeBase == null ? -1 : typeBase.indexOf('=');
         String typeBaseKey = eq >= 0 ? typeBase.substring(0, eq) : typeBase;
@@ -134,7 +158,7 @@ public final class FeatureDetails {
                 }
             }
             String human = CategoryNames.humanize(k + "=" + v.trim());
-            sb.append(humanReadableKey(k)).append(": ").append(enrichValue(k, v.trim())).append("\n");
+            out.add(humanReadableKey(k) + ": " + enrichValue(k, v.trim()));
         }
     }
 

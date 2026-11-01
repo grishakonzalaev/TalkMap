@@ -17,6 +17,8 @@ seeing_extract/
 /*.log
 /*.json
 /*.so
+/*.py
+/*.png
 
 # Среда разработки
 .idea/
