@@ -23,11 +23,22 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Validate Gradle wrapper
         uses: gradle/actions/wrapper-validation@v3
+
+      # На ubuntu-latest Android SDK уже предустановлен. Принимаем лицензии,
+      # чтобы AGP не падал на установке build-tools/платформы.
+      - name: Accept Android SDK licenses
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME  ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          SDKMGR=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}" -name sdkmanager -path "*/cmdline-tools/*" 2>/dev/null | head -n1)
+          if [ -z "$SDKMGR" ]; then
+            echo "sdkmanager not found; SDK contents:"
+            ls -R "${ANDROID_HOME:-$ANDROID_SDK_ROOT}" 2>/dev/null | head -50 || true
+          else
+            echo "Using sdkmanager: $SDKMGR"
+            yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          fi
 
       # Подпись подключается только для tag-сборок (релизов).
       # Для push/PR release-APK собирается без подписи (unsigned).
