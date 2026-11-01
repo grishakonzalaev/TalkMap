@@ -24,3 +24,8 @@ seeing_extract/
 .idea/
 *.iml
 captures/
+
+# Ключ подписи релиза (никогда не публиковать)
+*.jks
+*.keystore
+keystore.properties
