@@ -89,6 +89,8 @@ public class AccessibleMapView extends MapView {
     private final int[] screenLocation = new int[2];
 
     private Listener listener;
+    /** Активный источник тайлов карты (по умолчанию OSM). */
+    private MapSource currentSource = MapSource.OSM;
     private Marker locationMarker;
     private Marker searchMarker;
     private GeoPoint userLocation;
@@ -197,6 +199,8 @@ public class AccessibleMapView extends MapView {
         // пустая полоса. Поэтому ниже 15 не опускаемся.
         setMinZoomLevel(15.0);
         setTilesScaledToDpi(true);
+        // Источник тайлов по умолчанию — OSM.
+        setTileSource(currentSource.toTileSource());
         // Явно включаем view: с выключенным MapView скринридер не получает
         // hover-события и виртуальные узлы.
         setEnabled(true);
@@ -222,6 +226,38 @@ public class AccessibleMapView extends MapView {
 
     public void setListener(Listener l) {
         this.listener = l;
+    }
+
+    /** Возвращает активный источник тайлов карты. */
+    public MapSource currentMapSource() {
+        return currentSource;
+    }
+
+    /**
+     * Меняет источник тайлов карты, сохраняя текущий центр и масштаб, —
+     * на карте остаётся тот же участок, что был у предыдущего источника.
+     * Смена затрагивает только отрисовку тайлов; географические координаты,
+     * маркеры, объекты OSM-API и следование по улицам не меняются.
+     */
+    public void setMapSource(MapSource source) {
+        if (source == null) {
+            return;
+        }
+        if (source == currentSource) {
+            return;
+        }
+        IGeoPoint center = getMapCenter();
+        double zoom = getZoomLevelDouble();
+        currentSource = source;
+        setTileSource(source.toTileSource());
+        // Восстанавливаем тот же центр и масштаб (setTileSource сбрасывает их).
+        if (center != null) {
+            getController().setZoom(zoom);
+            getController().setCenter(new GeoPoint(center.getLatitude(), center.getLongitude()));
+        }
+        invalidate();
+        // Объекты и подписи пересчитываются для той же области.
+        scheduleReload();
     }
 
     /**

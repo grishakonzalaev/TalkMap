@@ -57,6 +57,7 @@ public class MainActivity extends AppCompatActivity
     private ImageButton btnZoomOut;
     private ImageButton btnZoomReset;
     private ImageButton btnSearch;
+    private Button btnMapSource;
     private View searchBar;
     private EditText searchInput;
     private Button searchGo;
@@ -80,6 +81,7 @@ public class MainActivity extends AppCompatActivity
         btnZoomOut = findViewById(R.id.btn_zoom_out);
         btnZoomReset = findViewById(R.id.btn_zoom_reset);
         btnSearch = findViewById(R.id.btn_search);
+        btnMapSource = findViewById(R.id.btn_map_source);
         searchBar = findViewById(R.id.search_bar);
         searchInput = findViewById(R.id.search_input);
         searchGo = findViewById(R.id.search_go);
@@ -90,6 +92,7 @@ public class MainActivity extends AppCompatActivity
         searchAdapter = new SearchAdapter();
         searchResults.setAdapter(searchAdapter);
         setupSearch();
+        setupMapSource();
 
         btnMyLocation.setOnClickListener(v -> {
             // Если только что озвучена улица (обводка), а TalkMan держит фокус
@@ -185,6 +188,67 @@ public class MainActivity extends AppCompatActivity
             hideSearch();
             map.centerOnSearchResult(r);
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Выбор источника карты: OSM (по умолчанию), Яндекс Карты, 2ГИС.
+    // Смена источника подгружает тот же участок карты в выбранном
+    // источнике; центр, масштаб, объекты и следование по улицам
+    // сохраняются (меняется только слой тайлов).
+    // ------------------------------------------------------------------
+    private void setupMapSource() {
+        updateMapSourceButton();
+        btnMapSource.setOnClickListener(v -> {
+            // Долгое нажатие кнопки открывает меню объекта под пальцем,
+            // а не выбор источника (единый паттерн с остальными кнопками).
+            if (map.handleStreetSelectionClick()) {
+                return;
+            }
+            showMapSourceMenu();
+        });
+        btnMapSource.setOnLongClickListener(v -> map.handleMenuLongPress());
+    }
+
+    private void showMapSourceMenu() {
+        MapSource current = map.currentMapSource();
+        String title = getString(R.string.map_source_menu_title, sourceDisplayName(current));
+        final MapSource[] sources = MapSource.values();
+        String[] names = new String[sources.length];
+        for (int i = 0; i < sources.length; i++) {
+            names[i] = sourceDisplayName(sources[i]);
+        }
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setItems(names, (d, which) -> setMapSource(sources[which]))
+                .create();
+        dialog.setOnShowListener(d -> dialog.getWindow().setDimAmount(0.3f));
+        dialog.show();
+    }
+
+    private void setMapSource(MapSource source) {
+        if (source == null || source == map.currentMapSource()) {
+            return;
+        }
+        map.setMapSource(source);
+        updateMapSourceButton();
+        map.announceForAccessibility(getString(R.string.map_source_menu_title,
+                sourceDisplayName(source)));
+    }
+
+    private void updateMapSourceButton() {
+        MapSource current = map.currentMapSource();
+        btnMapSource.setText(sourceDisplayName(current));
+        btnMapSource.setContentDescription(getString(R.string.btn_map_source,
+                sourceDisplayName(current)));
+        // Кнопка видна всегда, поэтому переносим фокус на неё после смены не нужно.
+    }
+
+    private String sourceDisplayName(MapSource source) {
+        if (source == null) {
+            return getString(R.string.map_source_osm);
+        }
+        // Берём отображаемое имя из MapSource (или из строковых ресурсов).
+        return source.displayName();
     }
 
     private void performSearch() {
