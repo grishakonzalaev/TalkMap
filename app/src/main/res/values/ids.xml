@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="action_show_details" type="id" />
+    <item name="action_copy_coords" type="id" />
+    <item name="action_route" type="id" />
+</resources>

@@ -50,9 +50,9 @@ public class AccessibleMapView extends MapView {
     private static final String EMPTY_HINT = "Свободно. Ведите пальцем дальше.";
 
     /** Custom accessibility actions, matching context-menu items. */
-    public static final int ACTION_SHOW_DETAILS = 0x10001;
-    public static final int ACTION_COPY_COORDS = 0x10002;
-    public static final int ACTION_ROUTE = 0x10003;
+    public static final int ACTION_SHOW_DETAILS = R.id.action_show_details;
+    public static final int ACTION_COPY_COORDS = R.id.action_copy_coords;
+    public static final int ACTION_ROUTE = R.id.action_route;
 
     public interface Listener {
         void onStatus(int resId);
@@ -1513,22 +1513,14 @@ public class AccessibleMapView extends MapView {
                 Log.d(TAG, "performAction CUSTOM id=" + virtualViewId + " action=" + action
                         + " type=" + (f != null ? f.type : "null"));
                 if (f != null && !"street".equals(f.type) && !"here".equals(f.type)) {
-                    switch (action) {
-                        case ACTION_SHOW_DETAILS:
-                            if (listener != null) {
-                                listener.onFeatureDetails(f);
-                            }
-                            break;
-                        case ACTION_COPY_COORDS:
-                            if (listener != null) {
-                                listener.onFeatureCopyCoords(f);
-                            }
-                            break;
-                        case ACTION_ROUTE:
-                            if (listener != null) {
-                                listener.onRoute(f);
-                            }
-                            break;
+                    if (listener != null) {
+                        if (action == ACTION_SHOW_DETAILS) {
+                            listener.onFeatureDetails(f);
+                        } else if (action == ACTION_COPY_COORDS) {
+                            listener.onFeatureCopyCoords(f);
+                        } else {
+                            listener.onRoute(f);
+                        }
                     }
                     performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                     return true;
