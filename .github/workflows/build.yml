@@ -70,10 +70,19 @@ jobs:
           name: talkmap-app-release
           path: app/build/outputs/apk/release/app-release.apk
 
+      # Ассет релиза именуем по конвенции talkmap{VERSION}.apk (напр. talkmap1.6.0.apk).
+      - name: Copy APK to talkmap{VERSION}.apk
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION=$(sed -n 's/.*versionName "\([^"]*\)".*/\1/p' app/build.gradle | head -n1)
+          APK=app/build/outputs/apk/release/app-release.apk
+          cp "$APK" "app/build/outputs/apk/release/talkmap${VERSION}.apk"
+          echo "Release asset name: talkmap${VERSION}.apk"
+
       # Релиз создаётся только при пуше тега вида v*.
       - name: Create GitHub release (tag builds)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/app-release.apk
+          files: app/build/outputs/apk/release/talkmap*.apk
           generate_release_notes: true
