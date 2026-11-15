@@ -36,4 +36,5 @@
     <string name="map_source_osm">OpenStreetMap</string>
     <string name="map_source_2gis">2ГИС</string>
     <string name="map_source_menu_title">Источник карты. Текущий: %1$s</string>
+    <string name="map_source_2gis_warning">Источник «2ГИС» добавлен, но работает нестабильно: объекты подгружаются через парсинг страницы и могут отображаться неточно или отсутствовать.</string>
 </resources>

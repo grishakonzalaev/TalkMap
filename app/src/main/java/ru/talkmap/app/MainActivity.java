@@ -231,6 +231,10 @@ public class MainActivity extends AppCompatActivity
         }
         map.setMapSource(source);
         updateMapSourceButton();
+        // Предупреждение о нестабильности источника 2ГИС (парсинг страницы).
+        if (source == MapSource.TWOGIS) {
+            map.announceForAccessibility(getString(R.string.map_source_2gis_warning));
+        }
         map.announceForAccessibility(getString(R.string.map_source_menu_title,
                 sourceDisplayName(source)));
     }
