@@ -191,7 +191,7 @@ public class MainActivity extends AppCompatActivity
     }
 
     // ------------------------------------------------------------------
-    // Выбор источника карты: OSM (по умолчанию), Яндекс Карты, 2ГИС.
+    // Выбор источника карты: OSM (по умолчанию) и 2ГИС.
     // Смена источника подгружает тот же участок карты в выбранном
     // источнике; центр, масштаб, объекты и следование по улицам
     // сохраняются (меняется только слой тайлов).
@@ -400,7 +400,8 @@ public class MainActivity extends AppCompatActivity
         String[] items = {
                 getString(R.string.menu_details),
                 getString(R.string.menu_copy_coords),
-                getString(R.string.menu_route)
+                getString(R.string.menu_route),
+                getString(R.string.menu_simulate_location)
         };
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(titleFor(f))
@@ -414,6 +415,9 @@ public class MainActivity extends AppCompatActivity
                             break;
                         case 2:
                             openRoutePicker(f);
+                            break;
+                        case 3:
+                            simulateLocationAt(f);
                             break;
                     }
                 })
@@ -456,6 +460,24 @@ public class MainActivity extends AppCompatActivity
             cm.setPrimaryClip(ClipData.newPlainText("coordinates", coords));
         }
         map.announceForAccessibility(getString(R.string.menu_coords_copied, coords));
+    }
+
+    /**
+     * «Симулировать местоположение»: переносит точку отсчёта расстояний на
+     * выбранный объект. Расстояния (и «Вы здесь») отсчитываются от новой точки,
+     * а не от реального GPS, — удобно проверять наполнение района без поездки.
+     */
+    private void simulateLocationAt(MapFeature f) {
+        if (f == null) {
+            return;
+        }
+        map.setUserLocation(new GeoPoint(f.lat, f.lon));
+        String label = (f.spokenName != null && !f.spokenName.isEmpty()) ? f.spokenName : f.name;
+        if (label == null || label.isEmpty()) {
+            label = CategoryNames.humanize(f.type);
+        }
+        map.announceForAccessibility(
+                getString(R.string.menu_simulate_location_done, label));
     }
 
     /** Действие скринридера «Показать подробности» — сразу открыть детали. */

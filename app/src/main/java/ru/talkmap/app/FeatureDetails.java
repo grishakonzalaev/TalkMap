@@ -43,8 +43,15 @@ public final class FeatureDetails {
             return out;
         }
 
+        // 2ГИС-объекты: выводим максимум доступной информации (бренд, рубрики,
+        // часы, описание, рейтинг/отзывы, фотографии, дополнительные атрибуты).
+        if ("2gis".equals(tags.get("source"))) {
+            append2gisParts(out, tags, f);
+        }
+
         String hours = firstOf(tags, "opening_hours", "opening_hours:url");
-        if (hours != null) {
+        if (hours != null && !"2gis".equals(tags.get("source"))
+                && !"круглосуточно".equals(hours)) {
             out.add("Часы работы: " + humanizeHours(hours));
         }
         String phone = firstOf(tags, "phone", "contact:phone", "tel");
@@ -75,6 +82,72 @@ public final class FeatureDetails {
     /** Одна строка «Координаты: lat, lon» — отдельный узел для скринридера. */
     private static String coords(MapFeature f) {
         return String.format(java.util.Locale.US, "Координаты: %.6f, %.6f", f.lat, f.lon);
+    }
+
+    /**
+     * Подробности для 2ГИС-объекта: бренд/сеть, рубрики, адрес, часы работы,
+     * описание, рейтинг/отзывы, фотографии, ближайшее метро и дополнительные
+     * атрибуты (кухня, услуги, оплата и т.д.). Не дублируем уже выведенные
+     * имя, тип, адрес и часы.
+     */
+    private static void append2gisParts(java.util.List<String> out,
+                                        Map<String, String> tags, MapFeature f) {
+        String addr = tags.get("address");
+        if (addr != null && !addr.isEmpty()) {
+            out.add("Адрес: " + addr);
+        }
+        String hours = tags.get("opening_hours");
+        if (hours != null && !hours.isEmpty()) {
+            out.add("Часы работы: " + humanizeHours(hours));
+        }
+        String brand = tags.get("brand");
+        if (brand != null && !brand.isEmpty()) {
+            out.add("Бренд: " + brand);
+        }
+        String ext = tags.get("extension");
+        if (ext != null && !ext.isEmpty()) {
+            out.add("Формат: " + ext);
+        }
+        String org = tags.get("org");
+        if (org != null && !org.isEmpty() && !org.equals(brand)) {
+            String extra = "";
+            String bc = tags.get("branch_count");
+            if (bc != null && !bc.isEmpty() && !"1".equals(bc)) {
+                extra = " (" + bc + " филиалов)";
+            }
+            out.add("Сеть: " + org + extra);
+        }
+        String rub = tags.get("additional_rubrics");
+        if (rub != null && !rub.isEmpty()) {
+            out.add("Рубрики: " + rub);
+        }
+        String desc = tags.get("description");
+        if (desc != null && !desc.isEmpty()) {
+            out.add("Описание: " + desc);
+        }
+        String rating = tags.get("rating");
+        String rc = tags.get("review_count");
+        if (rating != null && !rating.isEmpty()) {
+            StringBuilder sb = new StringBuilder("Рейтинг: " + rating);
+            if (rc != null && !rc.isEmpty()) {
+                sb.append(" (").append(rc).append(" отзывов)");
+            }
+            out.add(sb.toString());
+        } else if (rc != null && !rc.isEmpty()) {
+            out.add("Отзывов: " + rc);
+        }
+        String photos = tags.get("photo_count");
+        if (photos != null && !photos.isEmpty()) {
+            out.add("Фотографий: " + photos);
+        }
+        String metro = tags.get("nearest_metro");
+        if (metro != null && !metro.isEmpty()) {
+            out.add("Ближайшее метро: " + metro);
+        }
+        String attrs = tags.get("attributes");
+        if (attrs != null && !attrs.isEmpty()) {
+            out.add("Особенности: " + attrs);
+        }
     }
 
     /**
@@ -270,7 +343,12 @@ public final class FeatureDetails {
                 "ref", "ref:ru", "old_ref", "note", "note:ru", "description",
                 "wikidata", "wikipedia", "wikimedia_commons", "image", "image:panorama",
                 "attribution", "ele", "layer", "z_order",
-                "geometry", "id", "type", "version", "timestamp", "changeset", "user", "uid");
+                "geometry", "id", "type", "version", "timestamp", "changeset", "user", "uid",
+                // Служебные/2ГИС-теги — выводятся отдельными строками в 2ГИС-блоке.
+                "source", "firm_id", "2gis_category", "2gis_primary_rubric",
+                "extension", "additional_rubrics", "brand", "org", "branch_count",
+                "rating", "review_count", "photo_count", "nearest_metro", "attributes",
+                "address");
 
         TAG_KEY_HUMAN.put("amenity", "тип");
         TAG_KEY_HUMAN.put("shop", "тип");

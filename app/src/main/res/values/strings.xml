@@ -28,11 +28,12 @@
     <string name="menu_coords_copied">Координаты скопированы: %1$s</string>
     <string name="menu_route_no_app">Не найдено приложение для навигации.</string>
     <string name="menu_route_chooser">Проложить маршрут</string>
+    <string name="menu_simulate_location">Симулировать местоположение</string>
+    <string name="menu_simulate_location_done">Местоположение установлено. Расстояния отсчитываются от «%1$s».</string>
 
     <!-- Источники карты -->
     <string name="btn_map_source">Кнопка: источник карты — %1$s</string>
     <string name="map_source_osm">OpenStreetMap</string>
-    <string name="map_source_yandex">Яндекс Карты</string>
     <string name="map_source_2gis">2ГИС</string>
     <string name="map_source_menu_title">Источник карты. Текущий: %1$s</string>
 </resources>

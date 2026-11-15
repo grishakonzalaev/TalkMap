@@ -11,7 +11,7 @@ import android.util.Log;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
-import android.widget.TextView;
+
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityManager;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -29,17 +29,21 @@ import org.osmdroid.views.overlay.Marker;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * Карта, доступная незрячим пользователям.
  *
- * <p>Каждый загруженный объект OSM кладётся как реальный дочерний вью
- * (TextView) в точке на карте — см. rebuildObjectViews/addObjectView.
- * TalkBack видит его как обычный элемент с собственным меню действий
- * (подробности/координаты/маршрут). В режиме обводки пальцем экрана
- * скринридер озвучивает объект под пальцем, а при смене объекта подаётся
- * короткий тактильный сигнал (вибрация).</p>
+ * <p>Модель доступности — единый узел (как в Navia): сам MapView один
+ * доступный элемент, без отдельных дочерних TextView на каждый объект.
+ * В режиме обводки пальцем скринридер получает hover-события, объект под
+ * пальцем выбирается точечным hit-test (featureNear) и озвучивается на
+ * самом узле карты с именем, типом и расстоянием. Действия (двойной тап —
+ * маршрут, долгое нажатие — меню, «подробности/координаты/маршрут») идут
+ * через AccessibilityDelegate узла на объект под пальцем.</p>
  *
  * <p>Отдельно обрабатываются именованные улицы: если палец находится на
  * проезжей части (близко к геометрии дороги), озвучивается улица с
@@ -85,6 +89,12 @@ public class AccessibleMapView extends MapView {
     private final List<MapFeature> features = new ArrayList<>();
     private final List<OsmApiClient.RoadInfo> roads = new ArrayList<>();
     private OsmApiClient api;
+    private TwoGisApiClient twoGisApi;
+    /** В 2ГИС-режиме: OSM-база (номера домов + перекрёстки + дороги) без OSM-организаций. */
+    private List<MapFeature> twoGisOsmBase = new ArrayList<>();
+    private List<OsmApiClient.RoadInfo> twoGisOsmRoads = new ArrayList<>();
+    /** Последние организации 2ГИС (чтобы слить с базой при догрузке OSM). */
+    private List<MapFeature> twoGisLastFeatures;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Point tmpPoint = new Point();
     private final int[] screenLocation = new int[2];
@@ -157,16 +167,26 @@ public class AccessibleMapView extends MapView {
     /** Окно пары кликов TalkMan: двойное нажатие может длиться до ~1.5 c. */
     private static final long DOUBLE_CLICK_MS = 1500L;
     /** Окно, в котором клик по кнопке считается выбором озвученной улицы.
-     *  Незрячему пользователю нужно время, чтобы убрать палец с карты,
-     *  нащупать кнопку/место и сделать двойной тап. 15 секунд покрывает
-     *  этот интервал без ложных срабатываний (после выбора окно закрывается). */
-    private static final long STREET_SELECTION_MS = 15000L;
+     *  Выбор улицы доставляется кнопке как двойной тап TalkMan — пара
+     *  ACTION_CLICK в пределах DOUBLE_CLICK_MS. Поэтому окно берём равным
+     *  DOUBLE_CLICK_MS: ловим только мгновенный двойной тап сразу после
+     *  обводки улицы, а не произвольные клики. Раньше окно было 15 секунд,
+     *  и т.к. незрячий пользователь постоянно водит пальцем по карте
+     *  (обводка над улицей обновляет «свежесть»), почти любой клик кнопки
+     *  ошибочно включал следование по улице. */
+    private static final long STREET_SELECTION_MS = DOUBLE_CLICK_MS;
     private static final float DOUBLE_TAP_DIST_PX = 100f;
     /**
      * Модифицированный TalkBack (TalkMan) шлёт двойное нажатие как ДВА
      * ACTION_CLICK подряд. Пара кликов по одному узлу = один логический клик.
      */
     private long lastClickAt = 0;
+    /** Объект под последней точкой обводки — цель действий единого узла карты. */
+    private MapFeature currentFeature = null;
+    /** Последний виртуальный узел, получивший доступностный фокус (TalkBack). */
+    private int lastFocusedNode = -1;
+    /** Узел последнего клика пары TalkMan (двойное нажатие = два ACTION_CLICK). */
+    private int lastClickNode = Integer.MIN_VALUE;
 
     public AccessibleMapView(Context context) {
         super(context);
@@ -206,6 +226,8 @@ public class AccessibleMapView extends MapView {
         setFocusable(true);
         setFocusableInTouchMode(true);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
+        // Базовая подпись узла карты (пустое поле — скринридер не читает карту).
+        setContentDescription(getContext().getString(R.string.map_description));
 
         addMapListener(new MapListener() {
             @Override
@@ -584,6 +606,34 @@ public class AccessibleMapView extends MapView {
         }
         final double lat = center.getLatitude();
         final double lon = center.getLongitude();
+
+        // Источник 2ГИС: организации берём из 2ГИС, а номера домов и перекрёстки
+        // улиц — из OSM (в 2ГИС они не отдаются). Объединяем их в один набор.
+        if (currentSource.usesTwoGisData()) {
+            if (twoGisApi == null) {
+                twoGisApi = new TwoGisApiClient(getContext());
+            }
+            // Параллельно тянем OSM-базу: дороги (для перекрёстков) и дома.
+            loadTwoGisOsmBase(lat, lon, radius);
+            final double[] vb = viewportBounds();
+            twoGisApi.fetchAsync(vb[0], vb[1], vb[2], vb[3],
+                    new TwoGisApiClient.Callback() {
+                        @Override
+                        public void onResult(final List<MapFeature> newFeatures) {
+                            applyTwoGisResult(newFeatures);
+                        }
+
+                        @Override
+                        public void onError(Exception e) {
+                            Log.w(TAG, "2gis reload failed", e);
+                            if (listener != null) {
+                                listener.onStatus(R.string.status_network_error);
+                            }
+                        }
+                    });
+            return;
+        }
+
         api.fetchAsync(lat, lon, radius, new OsmApiClient.Callback() {
             @Override
             public void onResult(final List<MapFeature> newFeatures,
@@ -625,6 +675,99 @@ public class AccessibleMapView extends MapView {
     }
 
     /**
+     * В 2ГИС-режиме подгружает OSM-базу: дороги (для синтеза перекрёстков) и
+     * номера домов. OSM-организации отбрасываются — их заменяет 2ГИС.
+     * Если OSM-ответ пустой/ошибочный, продолжаем показывать хотя бы 2ГИС-организации.
+     */
+    /**
+     * Тянет геометрию дорог OSM для следования по улице и перекрёстков.
+     * Дома и улицы приходят из адресов 2ГИС (двухгик не отдаёт их отдельными
+     * объектами), поэтому OSM-номера домов (addr=) и OSM-организации не тащим.
+     * Перекрёстки оставляем от OSM-геометрии: у 2ГИС нет линий дорог, а точки
+     * организаций разбросаны по разным улицам и «пересечение» по ним ложное.
+     */
+    private void loadTwoGisOsmBase(double lat, double lon, double radius) {
+        api.fetchAsync(lat, lon, radius, new OsmApiClient.Callback() {
+            @Override
+            public void onResult(final List<MapFeature> newFeatures,
+                                 final List<OsmApiClient.RoadInfo> newRoads) {
+                List<MapFeature> base = new ArrayList<>();
+                for (MapFeature f : newFeatures) {
+                    if (f.type == null) {
+                        continue;
+                    }
+                    // В 2ГИС-режиме организации заменяет 2ГИС, но остановки
+                    // общественного транспорта 2ГИС в каталог организаций не
+                    // отдаёт (query «остановка» возвращает пустой profile),
+                    // поэтому реальные остановки берём из OSM-базы. Перекрёстки
+                    // тоже оставляем от OSM (тесселяция дорог).
+                    if (isTransportStopType(f.type) || "junction".equals(f.type)) {
+                        base.add(f);
+                    }
+                }
+                twoGisOsmBase = base;
+                twoGisOsmRoads = new ArrayList<>(newRoads);
+                // Пересобираем итоговый набор: актуальные 2ГИС-объекты.
+                applyTwoGisResult(twoGisLastFeatures);
+            }
+
+            @Override
+            public void onError(Exception e) {
+                Log.w(TAG, "2gis osm base failed", e);
+                // База не критична — организации 2ГИС всё равно покажем.
+            }
+        });
+    }
+
+    /** True для типов OSM, обозначающих остановки/станции общественного транспорта. */
+    private static boolean isTransportStopType(String type) {
+        if (type == null) {
+            return false;
+        }
+        return type.startsWith("highway=bus_stop")
+                || type.startsWith("highway=platform")
+                || type.startsWith("highway=tram_stop")
+                || type.startsWith("public_transport=")
+                || type.startsWith("railway=halt")
+                || type.startsWith("railway=tram_stop")
+                || type.startsWith("railway=station")
+                || type.startsWith("amenity=bus_station")
+                || type.startsWith("amenity=ferry_terminal");
+    }
+
+    /**
+     * Склеивает результат 2ГИС (организации + синтезированные дома/улицы) и
+     * выставляет общий набор на карту. Перекрёстки и дороги оставляем от OSM.
+     */
+    private void applyTwoGisResult(List<MapFeature> gisFeatures) {
+        // При зуме/сдвиге карта может попасть на незагруженную 900-м ячейку:
+        // collect вернёт пусто, пока грузятся 71 категория (~минуты). Не
+        // затираем уже загруженные организации пустым результатом — иначе
+        // «всё, кроме улиц», исчезает на время загрузки новой ячейки.
+        if (gisFeatures != null && countRealFeatures(gisFeatures) > 0) {
+            twoGisLastFeatures = gisFeatures;
+        }
+        List<MapFeature> merged = new ArrayList<>();
+        if (twoGisLastFeatures != null) {
+            Set<String> seen = new HashSet<>();
+            for (MapFeature f : twoGisLastFeatures) {
+                String k = f.type + "|" + f.name + "|"
+                        + String.format(Locale.US, "%.5f,%.5f", f.lat, f.lon);
+                if (seen.add(k)) {
+                    merged.add(f);
+                }
+            }
+        }
+        merged.addAll(twoGisOsmBase);
+        setFeatures(merged, twoGisOsmRoads);
+        if (listener != null) {
+            int shown = features.size() - (hereFeature != null ? 1 : 0);
+            listener.onCount(shown);
+            listener.onFeaturesUpdated();
+        }
+    }
+
+    /**
      * Радиус загрузки: половина диагонали видимого прямоугольника плюс запас,
      * чтобы объекты покрывали весь экран, а не только окрестность центра.
      */
@@ -648,6 +791,34 @@ public class AccessibleMapView extends MapView {
         double halfDiagonal = Math.hypot(dLatM, dLonM) / 2.0;
         // Запас 40%: карта догружает окрестность, пока пользователь сдвигает её.
         return Math.max(600, halfDiagonal * 1.4);
+    }
+
+    /** Углы видимого прямоугольника: [north, south, east, west]. */
+    private double[] viewportBounds() {
+        IGeoPoint center = getMapCenter();
+        if (center == null) {
+            return new double[]{0, 0, 0, 0};
+        }
+        double lat = center.getLatitude();
+        double lon = center.getLongitude();
+        if (getWidth() <= 0 || getHeight() <= 0) {
+            return new double[]{lat, lat, lon, lon};
+        }
+        Projection p = getProjection();
+        if (p == null) {
+            return new double[]{lat, lat, lon, lon};
+        }
+        IGeoPoint tl = p.fromPixels(0, 0);
+        IGeoPoint br = p.fromPixels(getWidth(), getHeight());
+        if (tl == null || br == null) {
+            return new double[]{lat, lat, lon, lon};
+        }
+        return new double[]{
+                Math.max(tl.getLatitude(), br.getLatitude()),   // north
+                Math.min(tl.getLatitude(), br.getLatitude()),   // south
+                Math.max(tl.getLongitude(), br.getLongitude()), // east
+                Math.min(tl.getLongitude(), br.getLongitude())  // west
+        };
     }
 
     /** Количество объектов, не являющихся синтезированными перекрёстками. */
@@ -722,6 +893,9 @@ public class AccessibleMapView extends MapView {
         // иначе при перезагрузке цепочка может остаться от старой загрузки.
         refreshFollowedSegments();
         lastVirtualNode = -1;
+        // Объекты перезагрузились: сбрасываем цель действий, чтобы меню/маршрут
+        // не открывались по устаревшему объекту из прошлой загрузки.
+        currentFeature = null;
         invalidate();
         // Сообщаем TalkBack, что содержимое изменилось.
         sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
@@ -771,58 +945,13 @@ public class AccessibleMapView extends MapView {
      * чтобы озвучка совпадала со сфокусированным объектом: иначе скринридер
      * проговаривает один объект, а выделяет/читает по символам соседний.
      */
+    /** Объект под пальцем: точечный hit-test по фичам. Реальных вью объектов
+     * больше нет (карта — виртуальные узлы), поэтому featureAtTop не нужен. */
     private MapFeature featureAtTop(float x, float y) {
-        Rect r = new Rect();
-        // Идём СВЕРХУ вниз: последний добавленный вью рисуется поверх всех,
-        // значит и фокусируется скринридером первым. Совпадение озвучки и
-        // фокуса — это выбор самого верхнего перекрывающего объекта.
-        for (int i = getChildCount() - 1; i >= 0; i--) {
-            View v = getChildAt(i);
-            if (!(v instanceof TextView)) {
-                continue;
-            }
-            Object tag = v.getTag();
-            if (!(tag instanceof MapFeature)) {
-                continue;
-            }
-            v.getHitRect(r);
-            if (r.contains((int) x, (int) y)) {
-                return (MapFeature) tag;
-            }
-        }
-        return null;
+        return featureNear(x, y);
     }
 
-    /**
-     * Фокусирует реальное вью объекта — ТОТ же элемент, что и выбранная фича.
-     * Так TalkBack озвучит, выделит и отдаст действия одному и тому же вью.
-     * Без этого читалка независимо фокусирует верхний перекрывающий вью
-     * (соседний объект), и речь/фокус/действия расходятся.
-     */
-    private void focusObjectView(MapFeature f) {
-        if (f == null) {
-            return;
-        }
-        for (int i = getChildCount() - 1; i >= 0; i--) {
-            View v = getChildAt(i);
-            if (!(v instanceof TextView)) {
-                continue;
-            }
-            Object tag = v.getTag();
-            if (tag == f) {
-                AccessibilityEvent event = AccessibilityEvent.obtain(
-                        AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED);
-                event.setSource(v);
-                event.setClassName(View.class.getName());
-                event.setPackageName(getContext().getPackageName());
-                event.setContentDescription(v.getContentDescription());
-                event.getText().add(v.getContentDescription());
-                sendAccessibilityEventUnchecked(event);
-                return;
-            }
-        }
-        // Вью не найдено — даём читалке самой выбрать (не мешаем).
-    }
+    
 
     private MapFeature nearestJunction(float x, float y) {
         if (getWidth() <= 0 || getHeight() <= 0 || features.isEmpty()) {
@@ -941,9 +1070,17 @@ public class AccessibleMapView extends MapView {
         }
         // Направление берём по ориентации ближайшего отрезка (как он
         // оцифрован в OSM) — стабильно и соответствует «с севера на юг».
-        return RuSpeech.streetDirectionPhrase(best.name,
+        String phrase = RuSpeech.streetDirectionPhrase(best.name,
                 bestSeg[0], bestSeg[1],
                 bestSeg[2], bestSeg[3]);
+        // Расстояние от последнего известного местоположения до ближайшей точки
+        // этой проезжей части — «улица Станиславского с севера на юг — 30 метров».
+        double dist = distanceFromHere(bestSeg[7], bestSeg[8]);
+        String d = distancePhrase(dist);
+        if (!d.isEmpty()) {
+            phrase = phrase + " — " + d;
+        }
+        return phrase;
     }
 
     private double[] projectToScreen(GeoPoint a, GeoPoint b, float px, float py) {
@@ -1023,20 +1160,44 @@ public class AccessibleMapView extends MapView {
         if ("junction".equals(f.type)) {
             return junctionPhrase(f);
         }
-        return RuSpeech.constructPhrase(f.spokenName, f.spokenType);
+        String phrase = RuSpeech.constructPhrase(f.spokenName, f.spokenType);
+        // Для 2ГИС после «имя, тип» добавляем адрес организации, если он есть
+        // (например, «Мясо шэф, мясной магазин, улица Станиславского, 24»).
+        if (f.tags != null && "2gis".equals(f.tags.get("source"))) {
+            String addr = f.tags.get("address");
+            if (addr != null && !addr.trim().isEmpty()) {
+                phrase = phrase + ", " + addr.trim();
+            }
+        }
+        // Расстояние от последнего известного местоположения до объекта —
+        // как в Navia: «Название, тип — 40 метров» (для всех источников).
+        double dist = distanceFromHere(f.lat, f.lon);
+        String d = distancePhrase(dist);
+        if (!d.isEmpty()) {
+            phrase = phrase + " — " + d;
+        }
+        return phrase;
     }
 
     /** «Перекрёсток: ...» + признаки рядом: светофор, пешеходный переход. */
     private String junctionPhrase(MapFeature f) {
         String base = (f.spokenName == null || f.spokenName.isEmpty())
                 ? "Перекрёсток" : f.spokenName;
+        String result;
         if (hasNearbyType(f, "highway=traffic_signals")) {
-            return base + ", со светофором";
+            result = base + ", со светофором";
+        } else if (hasNearbyType(f, "highway=crossing")) {
+            result = base + ", с пешеходным переходом";
+        } else {
+            result = base;
         }
-        if (hasNearbyType(f, "highway=crossing")) {
-            return base + ", с пешеходным переходом";
+        // Расстояние до перекрёстка.
+        double dist = distanceFromHere(f.lat, f.lon);
+        String d = distancePhrase(dist);
+        if (!d.isEmpty()) {
+            result = result + " — " + d;
         }
-        return base;
+        return result;
     }
 
     private boolean hasNearbyType(MapFeature center, String type) {
@@ -1078,22 +1239,18 @@ public class AccessibleMapView extends MapView {
                 // скринридер фокусирует (иначе озвучивается соседний объект,
                 // и чтение по символам/меню уходят на него). Для улиц/пустых
                 // мест без метки — точечный hit-test featureNear.
-                MapFeature f = featureAtTop(event.getX(), event.getY());
-                if (f == null) {
-                    f = featureNear(event.getX(), event.getY());
-                }
+                MapFeature f = featureNear(event.getX(), event.getY());
                 if (f != null) {
                     int node = indexOfFeature(f);
                     if (node >= 0 && node != lastVirtualNode) {
                         lastVirtualNode = node;
                         lastStreetPhrase = null;
-                        // Объекты — это РЕАЛЬНЫЕ вью на карте. Фокусируем именно
-                        // то вью, которое соответствует выбранной фиче: тогда
-                        // TalkBack озвучит, выделит и отдаст действия ОДНОМУ и
-                        // тому же объекту. Иначе читалка фокусирует соседний
-                        // перекрывающий вью (code «Степная 25Б»), а приложение
-                        // выбирало другой («Быстроном») — рассинхрон речи/фокуса.
-                        focusObjectView(f);
+                        currentFeature = f;
+                        // Каждый объект — отдельный ВИРТУАЛЬНЫЙ узел. Озвучиваем
+                        // его через TYPE_VIEW_HOVER_ENTER + announcement, а не
+                        // через реальное вью: скринридер читает узел как
+                        // самостоятельный элемент.
+                        sendHoverEnter(node, phraseFor(f));
                         performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                     }
                     return true;
@@ -1102,6 +1259,8 @@ public class AccessibleMapView extends MapView {
                 // Метод сам ставит фокус на виртуальный узел улицы: иначе TalkMan
                 // сохраняет фокус на последней кнопке (зум/местоположение) и
                 // двойной тап активирует кнопку, а не улицу.
+                // Объект (currentFeature) НЕ сбрасываем: он остаётся целью действий
+                // (подробности/маршрут/меню) после того, как палец ушёл с объекта.
                 if (announceStreetUnderFinger(event.getX(), event.getY())) {
                     return true;
                 }
@@ -1115,6 +1274,8 @@ public class AccessibleMapView extends MapView {
                 sendHoverExit();
                 lastVirtualNode = -1;
                 lastStreetPhrase = null;
+                // currentFeature НЕ обнуляем: это последний озвученный объект —
+                // цель действий скринридера, пока пользователь не выберет другой.
                 return true;
             default:
                 return handled;
@@ -1354,19 +1515,144 @@ public class AccessibleMapView extends MapView {
     }
 
     // ------------------------------------------------------------------
-    // Доступность карты. Мы НЕ используем виртуальные узлы: вместо этого
-    // каждый объект кладётся как реальный дочерний TextView в точке на карте
-    // (см. rebuildObjectViews / addObjectView). Скринридер читает и
-    // фокусирует их как обычные элементы с собственным меню действий.
+    // Доступность карты: каждый объект — ОТДЕЛЬНЫЙ виртуальный узел
+    // (AccessibilityNodeProvider). Скринридер обводит экран пальцем и
+    // озвучивает объект под пальцем как самостоятельный узел с id = index
+    // (событие TYPE_VIEW_HOVER_ENTER + перехват performAction).
     // ------------------------------------------------------------------
-    @Override
+    private MapNodeProvider nodeProvider;
+
     public AccessibilityNodeProvider getAccessibilityNodeProvider() {
-        // Возвращаем null: карта работает через стандартное дерево доступности
-        // ViewGroup, поэтому TalkBack/TalkMan видят реальные дочерние вью
-        // объектов. Если бы здесь возвращался провайдер виртуальных узлов,
-        // Android «виртуализировал» бы всё поддерево и реальные вью
-        // не попадали бы в дерево доступности.
-        return null;
+        if (nodeProvider == null) {
+            nodeProvider = new MapNodeProvider();
+        }
+        return nodeProvider;
+    }
+
+    /**
+     * Виртуальные узлы объектов на едином узле карты. Каждый объект из
+     * features (features.get(index)) представлен узлом id = index. Озвучка
+     * объекта — через {@link #phraseFor(MapFeature)}. Действия сознательно
+     * сведены к минимуму: объект просто читается скринридером, без сложного
+     * меню (подробности/маршрут/координаты).
+     */
+    private class MapNodeProvider extends AccessibilityNodeProvider {
+        @Override
+        public AccessibilityNodeInfo createAccessibilityNodeInfo(int virtualViewId) {
+            AccessibilityNodeInfo info = AccessibilityNodeInfo.obtain();
+            info.setSource(AccessibleMapView.this, virtualViewId);
+            info.setPackageName(getContext().getPackageName());
+            info.setClassName(MapView.class.getName());
+            info.setFocusable(true);
+            info.setEnabled(true);
+            info.setClickable("street".equals(featureById(virtualViewId) != null
+                    ? featureById(virtualViewId).type : ""));
+
+            if (virtualViewId == AccessibilityNodeProvider.HOST_VIEW_ID) {
+                // Хост-узел — корень виртуального дерева. Обязан быть focusable,
+                // иначе скринридер не может в него войти и добраться до узлов
+                // объектов. Описание пустое, чтобы фокус на контейнере был
+                // беззвучным, а читался именно объект под пальцем.
+                info.setFocusable(true);
+                info.setContentDescription(null);
+                getLocationOnScreen(screenLocation);
+                Rect bounds = new Rect(screenLocation[0], screenLocation[1],
+                        screenLocation[0] + getWidth(), screenLocation[1] + getHeight());
+                info.setBoundsInScreen(bounds);
+                info.setVisibleToUser(true);
+                for (int i = 0; i < features.size(); i++) {
+                    info.addChild(AccessibleMapView.this, i);
+                }
+                info.addAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
+                info.addAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD);
+                return info;
+            }
+
+            if (virtualViewId < 0 || virtualViewId >= features.size()) {
+                info.setContentDescription(EMPTY_HINT);
+                return info;
+            }
+            MapFeature f = features.get(virtualViewId);
+            String phrase = phraseFor(f);
+            info.setContentDescription(phrase);
+            info.setText(phrase);
+            info.setParent(AccessibleMapView.this, AccessibilityNodeProvider.HOST_VIEW_ID);
+            // Важно: НЕ скрывать объекты через isOnScreen. Виртуальные узлы
+            // должны оставаться в accessibility-дереве, даже если их точка чуть
+            // за краем экрана, иначе TalkBack/uiautomator отбрасывает организации
+            // (видит только улицы). Границы boundsInScreen всё равно ограничивают
+            // попадание пальцем, а скрытие узла лишает скринридер объекта.
+            info.setVisibleToUser(true);
+            info.setBoundsInScreen(boundsFor(f));
+            info.addAction(AccessibilityNodeInfo.ACTION_CLICK);
+            return info;
+        }
+
+        @Override
+        public boolean performAction(int virtualViewId, int action, android.os.Bundle arguments) {
+            // Фокус доступности: TalkBack ставит фокус на узел, чтобы показать
+            // его. Без этого узлы объектов не получают фокус.
+            if (action == AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS) {
+                lastFocusedNode = virtualViewId;
+                return true;
+            }
+            if (action == AccessibilityNodeInfo.ACTION_CLEAR_ACCESSIBILITY_FOCUS) {
+                if (lastFocusedNode == virtualViewId) {
+                    lastFocusedNode = -1;
+                }
+                return true;
+            }
+            if (action == AccessibilityNodeInfo.ACTION_CLICK) {
+                long now = SystemClock.uptimeMillis();
+                // TalkMan шлёт «двойное нажатие» как ДВА ACTION_CLICK подряд —
+                // гасим второй, как делали раньше.
+                if (now - lastClickAt > 0 && now - lastClickAt <= DOUBLE_CLICK_MS) {
+                    lastClickAt = now;
+                    return true;
+                }
+                lastClickAt = now;
+                MapFeature f = featureById(virtualViewId);
+                if (f != null && "street".equals(f.type)) {
+                    toggleFollowStreet(f);
+                    return true;
+                }
+                if (f != null && !"here".equals(f.type) && listener != null) {
+                    listener.onRoute(f);
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                    return true;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public java.util.List<AccessibilityNodeInfo> findAccessibilityNodeInfosByText(
+                String text, int virtualViewId) {
+            java.util.List<AccessibilityNodeInfo> result = new java.util.ArrayList<>();
+            if (text == null || text.isEmpty()) {
+                return result;
+            }
+            String query = text.toLowerCase();
+            for (int i = 0; i < features.size(); i++) {
+                MapFeature f = features.get(i);
+                if (f.name.toLowerCase().contains(query)
+                        || f.spokenType.toLowerCase().contains(query)) {
+                    result.add(createAccessibilityNodeInfo(i));
+                }
+            }
+            return result;
+        }
+
+        @Override
+        public AccessibilityNodeInfo findFocus(int focus) {
+            if ((focus == AccessibilityNodeInfo.FOCUS_ACCESSIBILITY
+                    || focus == AccessibilityNodeInfo.FOCUS_INPUT)
+                    && lastFocusedNode >= 0 && lastFocusedNode < features.size()) {
+                return createAccessibilityNodeInfo(lastFocusedNode);
+            }
+            return null;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1846,6 +2132,45 @@ public class AccessibleMapView extends MapView {
         return Math.hypot(dLat, dLon);
     }
 
+    /** Расстояние от последнего известного местоположения до объекта (м), либо -1. */
+    private double distanceFromHere(double lat, double lon) {
+        if (userLocation == null) {
+            return -1;
+        }
+        return distanceMeters(userLocation, new GeoPoint(lat, lon));
+    }
+
+    /** Русская фраза расстояния: «40 метров», «1,2 километра». */
+    private static String distancePhrase(double meters) {
+        if (meters < 0) {
+            return "";
+        }
+        if (meters < 950) {
+            int m = (int) Math.round(meters);
+            // Склонение: «1 метр», «2 метра», «5 метров».
+            if (m >= 11 && m <= 14) {
+                return m + " метров";
+            }
+            int last = m % 10;
+            String unit;
+            if (last == 1) {
+                unit = " метр";
+            } else if (last >= 2 && last <= 4) {
+                unit = " метра";
+            } else {
+                unit = " метров";
+            }
+            return m + unit;
+        }
+        // Километры с одним знаком после запятой.
+        double km = meters / 1000.0;
+        String s = String.format(java.util.Locale.US, "%.1f", km).replace(',', '.');
+        if (s.endsWith(".0")) {
+            s = s.substring(0, s.length() - 2);
+        }
+        return s + " километра";
+    }
+
     private OsmApiClient.RoadInfo roadNear(float x, float y) {
         OsmApiClient.RoadInfo best = null;
         double bestScore = Double.MAX_VALUE;
@@ -2004,16 +2329,26 @@ public class AccessibleMapView extends MapView {
         return 300.0 / (256.0 * Math.pow(2, zoom)) * 360.0;
     }
 
+    /** Объект на экране (в пределах видимой области карты). */
+    private boolean isOnScreen(MapFeature f) {
+        if (getWidth() <= 0 || getHeight() <= 0) {
+            return false;
+        }
+        getProjection().toPixels(new GeoPoint(f.lat, f.lon), tmpPoint);
+        return tmpPoint.x >= 0 && tmpPoint.x <= getWidth()
+                && tmpPoint.y >= 0 && tmpPoint.y <= getHeight();
+    }
+
     private MapFeature featureById(int id) {
         return (id >= 0 && id < features.size()) ? features.get(id) : null;
     }
 
     /**
      * Объект-цель для ACTION_LONG_CLICK/ACTION_CLICK: приоритет — реальная
-     * точка обводки (lastHoverX/Y) через точный хит-тест featureNear, затем
-     * fallback на virtualViewId. Так меню/маршрут открываются для того объекта,
-     * на который указывает пользователь, а не для соседнего узла с
-     * перекрывающимся bounds (который мог прислать TalkBack).
+     * точка обводки (lastHoverX/Y) через верхнюю метку featureAtTop, затем
+     * fallback на точечный hit-test featureNear. Так меню/маршрут открываются
+     * для того объекта, на который указывает пользователь, а не для соседнего
+     * узла с перекрывающимся bounds (который мог прислать TalkBack).
      */
     private MapFeature actionTargetFeature() {
         if (lastHoverX >= 0 && lastHoverY >= 0) {
@@ -2066,15 +2401,6 @@ public class AccessibleMapView extends MapView {
             return obj;
         }
         return null;
-    }
-
-    private boolean isOnScreen(MapFeature f) {
-        if (getWidth() <= 0) {
-            return false;
-        }
-        getProjection().toPixels(new GeoPoint(f.lat, f.lon), tmpPoint);
-        return tmpPoint.x >= 0 && tmpPoint.x <= getWidth()
-                && tmpPoint.y >= 0 && tmpPoint.y <= getHeight();
     }
 
     private Rect boundsFor(MapFeature f) {
@@ -2174,157 +2500,18 @@ public class AccessibleMapView extends MapView {
     }
 
     // ------------------------------------------------------------------
-    // Слой реальных вью объектов на карте. В отличие от виртуальных узлов
-    // (которые TalkBack/TalkMan на этой прошивке не обходят) это обычные
-    // дочерние TextView, лежащие В ТОЧКЕ объекта на карте. osmdroid сам
-    // держит их на месте при панорамировании (MapView.myOnLayout ставит
-    // вью по GeoPoint). Скринридер читает их как реальные элементы и может
-    // показать меню действий. Кладём только видимые на экране объекты.
+    // Объекты карты — виртуальные узлы (AccessibilityNodeProvider), а не
+    // реальные дочерние вью. Слой реальных вью больше не используется:
+    // скринридер обводит экран и читает объекты как отдельные виртуальные
+    // узлы. rebuildObjectViews оставлен как совместимая пустая операция
+    // (MainActivity вызывает его после обновления объектов), но ничего не
+    // рисует — реальных вью объектов нет.
     // ------------------------------------------------------------------
     public void rebuildObjectViews() {
-        // Снять провайдер виртуальных узлов: пока он есть, Android «забирает»
-        // всё поддерево и реальные дочерние вью не попадают в дерево
-        // доступности (их не видит ни один скринридер).
-        removeObjectViews();
-        if (features.isEmpty() || getWidth() <= 0 || getHeight() <= 0) {
-            return;
-        }
-        List<MapFeature> visible = new ArrayList<>();
-        for (MapFeature f : features) {
-            if ("here".equals(f.type)) {
-                continue;
-            }
-            // Экранные координаты объекта: за пределами экрана не кладём.
-            if (isOnScreen(f)) {
-                visible.add(f);
-            }
-        }
-        for (MapFeature f : visible) {
-            addObjectView(f);
-        }
-        if (!visible.isEmpty()) {
-            Log.i(TAG, "object views placed=" + visible.size());
-        }
-    }
-
-    private void addObjectView(MapFeature f) {
-        // Вью объекта — НЕВИДИМАЯ метка. Текст оставляем в `setText`, чтобы у вью
-        // был РЕАЛЬНЫЙ размер (bounds) — по нему скринридер точно попадает под
-        // палец и фокусирует ИМЕННО этот объект, а не соседнюю кнопку. Но цвет
-        // текста полностью прозрачный (alpha=0): зримо подпись не рисуется, и
-        // визуальный слой карты остаётся как есть. Скринридеру объект доступен
-        // через contentDescription и AccessibilityDelegate.
-        TextView tv = new TextView(getContext());
-        String phrase = phraseFor(f);
-        tv.setText(phrase);
-        // Полностью прозрачный текст: занимает место (bounds) но не виден.
-        tv.setTextColor(0x00FFFFFF);
-        // Прозрачный фон — никакой плашки под текстом.
-        tv.setBackgroundColor(0x00000000);
-        tv.setPadding(8, 4, 8, 4);
-        tv.setTextSize(13);
-        tv.setContentDescription(phrase);
-        // НЕ делаем кликабельным: иначе подпись перехватывает жест перетаскивания
-        // карты (объекты плотные, вертикальный свайп умирает на подписи). Действия
-        // приходят скринридеру через AccessibilityDelegate ниже (ACTION_CLICK /
-        // ACTION_LONG_CLICK / три пункта меню), а не через физический тап.
-        tv.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
-        tv.setClickable(false);
-        MapFeature feature = f;
-        // Метка на карте — её и фокусирует скринридер (верхняя под пальцем).
-        // Сохраняем сам объект, чтобы озвучка совпадала со сфокусированным.
-        tv.setTag(feature);
-        tv.setAccessibilityDelegate(new View.AccessibilityDelegate() {
-            @Override
-            public void onInitializeAccessibilityNodeInfo(View host, AccessibilityNodeInfo info) {
-                super.onInitializeAccessibilityNodeInfo(host, info);
-                info.setFocusable(true);
-                info.setClickable(true);
-                info.addAction(AccessibilityNodeInfo.ACTION_CLICK);
-                info.addAction(AccessibilityNodeInfo.ACTION_LONG_CLICK);
-                info.addAction(new AccessibilityNodeInfo.AccessibilityAction(
-                        ACTION_SHOW_DETAILS, getContext().getString(R.string.menu_details)));
-                info.addAction(new AccessibilityNodeInfo.AccessibilityAction(
-                        ACTION_COPY_COORDS, getContext().getString(R.string.menu_copy_coords)));
-                info.addAction(new AccessibilityNodeInfo.AccessibilityAction(
-                        ACTION_ROUTE, getContext().getString(R.string.menu_route)));
-            }
-
-            @Override
-            public boolean performAccessibilityAction(View host, int action, android.os.Bundle args) {
-                long now = SystemClock.uptimeMillis();
-                // TalkMan шлёт «двойное нажатие» как ДВА ACTION_CLICK подряд —
-                // гасим второй, как в виртуальных узлах (lastClickAt).
-                if (action == AccessibilityNodeInfo.ACTION_CLICK && now - lastClickAt <= DOUBLE_CLICK_MS) {
-                    lastClickAt = now;
-                    Log.d(TAG, "pair click consumed (object view)");
-                    return true;
-                }
-                if (action == AccessibilityNodeInfo.ACTION_CLICK) {
-                    lastClickAt = now;
-                    // Пока идёт следование по улице, двойной тап отключает его —
-                    // а НЕ открывает маршрут. Раньше сюда попадал соседний объект
-                    // (адрес «улица X, дом N» лежит поверх подписи улицы, его type
-                    // не «street») — и вместо отключения открывался выбор навигатора.
-                    if (followedStreetName != null) {
-                        if ("street".equals(feature.type)) {
-                            // Если это та же улица — отключим; если другая — переключимся.
-                            toggleFollowStreet(feature);
-                        } else {
-                            detachFollowStreet("Следование по улице "
-                                    + followedStreetName + " отключено.");
-                        }
-                        return true;
-                    }
-                    if ("street".equals(feature.type)) {
-                        toggleFollowStreet(feature);
-                    } else {
-                        if (listener != null) {
-                            listener.onRoute(feature);
-                        }
-                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                    }
-                    return true;
-                }
-                if (action == AccessibilityNodeInfo.ACTION_LONG_CLICK) {
-                    if (!"street".equals(feature.type) && listener != null) {
-                        listener.onFeatureMenu(feature);
-                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                        return true;
-                    }
-                    return false;
-                }
-                if (action == ACTION_SHOW_DETAILS) {
-                    fireDetails(feature);
-                    return true;
-                }
-                if (action == ACTION_COPY_COORDS) {
-                    fireCopyCoords(feature);
-                    return true;
-                }
-                if (action == ACTION_ROUTE) {
-                    fireRoute(feature);
-                    return true;
-                }
-                return super.performAccessibilityAction(host, action, args);
-            }
-        });
-        MapView.LayoutParams lp = new MapView.LayoutParams(
-                MapView.LayoutParams.WRAP_CONTENT, MapView.LayoutParams.WRAP_CONTENT,
-                new GeoPoint(f.lat, f.lon), MapView.LayoutParams.CENTER, 0, 0);
-        addView(tv, lp);
-    }
-
-    private void removeObjectViews() {
-        // Удаляем только наши объектные вью; кнопки/маркеры не трогаем.
-        for (int i = getChildCount() - 1; i >= 0; i--) {
-            View v = getChildAt(i);
-            if (v instanceof TextView && v.getContentDescription() != null
-                    && !v.getContentDescription().toString().isEmpty()
-                    && !(v instanceof android.widget.Button)
-                    && !(v instanceof android.widget.ImageButton)) {
-                removeViewAt(i);
-            }
+        // Реальных вью объектов нет — только виртуальные узлы.
+        if (nodeProvider != null) {
+            // Узлы принадлежат карте; при смене набора объектов ничего
+            // физически удалять не нужно.
         }
     }
 
